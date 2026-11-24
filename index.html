@@ -194,6 +194,26 @@ main { max-width: 760px; margin: 0 auto; display: grid; gap: 14px; padding-block
 .foot a { color: inherit; }
 @media (prefers-reduced-motion: reduce) { .pill.pulse::before, .dot.live { animation: none; } }
 @media (max-width: 560px) { .px { font-size: 1.15rem; } .brand { display: none; } .select-wrap { max-width: none; } }
+
+/* ---------- options model ---------- */
+.bars { display: grid; gap: 8px; margin-top: 8px; }
+.bar { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 76px; gap: 10px; align-items: center; font-size: .86rem; font-weight: 600; }
+.bar small { display: block; color: var(--muted); font-size: .74rem; font-weight: 600; }
+.bar .track { position: relative; height: 12px; background: var(--chip); border-radius: 6px; }
+.bar .track i { position: absolute; top: 0; bottom: 0; border-radius: 6px; }
+.bar .track .zero-l { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--faint); }
+.bar .val { text-align: right; font-weight: 800; font-variant-numeric: tabular-nums; }
+.cd { fill: var(--faint); opacity: .35; }
+.cd-pair { fill: var(--drift); opacity: .85; }
+.cd-best { fill: none; stroke: var(--ink); stroke-width: 2.5; }
+.cd-lead { fill: none; stroke: var(--down); stroke-width: 2; }
+.cdk { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; background: var(--faint); opacity: .6; }
+.cdk.pair { background: var(--drift); opacity: 1; }
+.cdk.best { background: none; border: 2px solid var(--ink); opacity: 1; }
+.cdk.lead { background: none; border: 2px solid var(--down); border-radius: 2px; transform: rotate(45deg); opacity: 1; }
+details > summary { cursor: pointer; font-weight: 700; padding: 4px 0; }
+details[open] > summary { margin-bottom: 6px; }
+@media (max-width: 520px) { .bar { grid-template-columns: minmax(0, 1fr) 70px; } .bar .track { grid-column: 1 / -1; grid-row: 2; } }
 </style>
 </head><body>
 <div id="app"><p style="padding:24px;font:16px system-ui">Loading Pairs Lab…</p></div>
@@ -1060,6 +1080,162 @@ const Engine = (() => {
     return { ...cfg, options: { ...cfg.options, min_dte, max_dte } };
   }
 
+  // ---------------------------------------------------------------- Monte Carlo options model (mirrors statarb/montecarlo.py)
+  const MC = { strikes: [0.90, 0.95, 1.0, 1.05, 1.10], maxQty: 6, nExp: 3, maxDte: 120, block: 5 };
+  const MC_REGIMES = [
+    ["Normal", 0.40, { vol: 1.0, eps: 1.0, iv: 1.0 }],
+    ["Historical replay", 0.20, { boot: true, iv: 1.0 }],
+    ["High volatility", 0.11, { vol: 1.8, eps: 1.5, iv: 1.35 }],
+    ["Calm market", 0.11, { vol: 0.7, eps: 0.8, iv: 0.75 }],
+    ["Relationship breaks", 0.10, { vol: 1.0, brk: true, iv: 1.1 }],
+    ["Market drop", 0.04, { vol: 1.5, eps: 1.3, iv: 1.5, jump: -0.08 }],
+    ["Market rally", 0.04, { vol: 1.3, eps: 1.2, iv: 1.2, jump: 0.06 }],
+  ];
+  function mcRegimes(prec) {
+    const bw = prec && prec.n >= 3 ? Math.min(0.30, Math.max(0.05, prec.broke / prec.n)) : 0.10;
+    return MC_REGIMES.map(([name, w, prm]) => [name, prm.brk ? bw : w * (1 - bw) / (1 - 0.10), prm]);
+  }
+  function median(sorted) { const n = sorted.length; return n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2; }
+
+  function monteCarloPlan(md, pair, cfg, t = null, nPaths = 4000, prec = null, equity = null) {
+    const [a, b] = pair;
+    t = t == null ? md.dates.length - 1 : t;
+    const d0 = md.dates[t], la = logs(md.closes[a]), lb = logs(md.closes[b]);
+    const sig = computeSignal(la, lb, t, cfg.signal, d0);
+    if (Number.isNaN(sig.z)) throw new Error(sig.reasons[0] || "No signal");
+    if (!prec) prec = precedent(md, pair, cfg);
+    const side = sig.z > 0 ? 1 : -1;
+
+    // statistical calibration (only data up to day t)
+    const rb = diff(Array.from(lb.slice(t - 60, t + 1))).filter(v => !Number.isNaN(v));
+    const sigmaB = std(rb), hl = sig.half_life;
+    const phi = Number.isFinite(hl) && hl > 0 ? Math.pow(2, -1 / hl) : 1.0;
+    const sd = sig.resid_std, m = sig.spread - sig.z * sd;
+    const sigEps = phi < 1 ? sd * Math.sqrt(1 - phi * phi) : sd * 0.3;
+    const L = cfg.signal.lookback, sAll = Array.from(la, (v, i) => v - sig.alpha - sig.beta * lb[i]);
+    const dsStd = std(diff(sAll.slice(t - L, t + 1)).filter(v => !Number.isNaN(v)));
+    const eb = [], es = [];
+    for (let k = Math.max(1, t - 500) + 1; k <= t; k++) {
+      const x1 = lb[k] - lb[k - 1], x2 = sAll[k] - m - phi * (sAll[k - 1] - m);
+      if (Number.isFinite(x1) && Number.isFinite(x2)) { eb.push(x1); es.push(x2); }
+    }
+    const nb = eb.length;
+
+    // Monte Carlo paths
+    const regimes = mcRegimes(prec);
+    const counts = regimes.map(r => Math.floor(r[1] * nPaths));
+    counts[0] += nPaths - counts.reduce((s, c) => s + c, 0);
+    const H = cfg.signal.max_hold_days, W = H + 1;
+    const rng = mulberry32(crc32(`${a}/${b}|${d0}`));
+    const SA = new Float64Array(nPaths * W), SB = new Float64Array(nPaths * W), tau = new Int32Array(nPaths), reg = new Int32Array(nPaths);
+    const s0 = sig.spread, x0 = lb[t], exitZ = cfg.signal.exit_z, stopZ = cfg.signal.stop_z;
+    let p = 0;
+    regimes.forEach(([, , prm], ri) => {
+      const vol = prm.vol ?? 1.0, eps = prm.eps ?? 1.0, jump = prm.jump ?? 0.0, boot = !!prm.boot && nb > MC.block, brk = !!prm.brk;
+      for (let n = 0; n < counts[ri]; n++) {
+        let s = s0, x = x0, j = 0, ex = 0;
+        SA[p * W] = Math.exp(sig.alpha + sig.beta * x + s); SB[p * W] = Math.exp(x);
+        for (let d = 1; d <= H; d++) {
+          if (boot) {
+            if ((d - 1) % MC.block === 0) j = Math.floor(rng() * nb);
+            const k = (j + (d - 1) % MC.block) % nb;
+            x += eb[k]; s = m + phi * (s - m) + es[k];
+          } else {
+            const e1 = normal(rng), e2 = normal(rng);
+            x += vol * sigmaB * e1 + (d === 1 ? jump : 0.0);
+            s = brk ? s + dsStd * 1.2 * e2 : m + phi * (s - m) + eps * sigEps * e2;
+          }
+          SA[p * W + d] = Math.exp(sig.alpha + sig.beta * x + s); SB[p * W + d] = Math.exp(x);
+          const z = (s - m) / sd;
+          if (ex === 0 && (side * z <= exitZ || Math.abs(z) >= stopZ)) ex = d;
+        }
+        tau[p] = ex || H; reg[p] = ri; p++;
+      }
+    });
+    const ivm = Float64Array.from(reg, r => regimes[r][2].iv ?? 1.0);
+
+    // candidate legs: 5 strikes x calls/puts x 3 expiries on each stock
+    const exps = monthlyExpiries(d0, 130).filter(e => { const n = daysBetween(d0, e); return cfg.options.min_dte <= n && n <= MC.maxDte; }).slice(0, MC.nExp);
+    const fee1 = fees(1, cfg.costs);
+    const budget = Math.min(cfg.risk.max_loss_per_trade_pct, cfg.risk.max_total_premium_pct) * (equity || cfg.risk.starting_equity);
+    const qmax = Math.min(MC.maxQty, cfg.risk.max_contracts_per_leg), rate = md.rate;
+    const legsByExp = {};
+    let nLegs = 0;
+    for (const e of exps) {
+      const dte = daysBetween(d0, e), cut = Math.max(1, Math.floor((dte - cfg.options.exit_dte) * 5 / 7));
+      legsByExp[e] = { [a]: [], [b]: [] };
+      for (const [sym, S] of [[a, SA], [b, SB]]) {
+        const spot = md.closes[sym][t], step = strikeStep(spot);
+        const ks = [...new Set(MC.strikes.map(f => Math.floor(spot * f / step + 0.5) * step))].sort((x, y) => x - y);
+        for (const right of [CALL, PUT]) for (const k of ks) {
+          const q = md.options.quote(sym, d0, e, k, right);
+          if (!q || q.ask == null || q.ask <= 0 || q.iv == null) continue;
+          const buy = buyPrice(q, cfg.costs), exitCost = (qSpread(q) || 0) / 2 + slippage(q, cfg.costs);
+          const dd = Math.abs(bsGreeks(spot, k, dte / 365, rate, q.iv, right).delta) * spot;
+          const net = new Float64Array(nPaths);
+          for (let i = 0; i < nPaths; i++) {
+            const te = Math.min(tau[i], cut), trem = Math.max(dte - te * 7 / 5, 0) / 365;
+            const v = bsPrice(S[i * W + te], k, trem, rate, q.iv * ivm[i], right);
+            net[i] = Math.max(Math.max(v - exitCost, 0.0) * MULT - fee1, 0.0); // worthless: let it expire, no fee
+          }
+          legsByExp[e][sym].push({ q, spot, buy, cost: buy * MULT + fee1, net, dd });
+          nLegs++;
+        }
+      }
+    }
+
+    // score every combination
+    const entries = [];
+    for (const e of exps) for (const A of legsByExp[e][a]) for (const B of legsByExp[e][b]) {
+      const directionOk = side > 0 ? (A.q.right === PUT && B.q.right === CALL) : (A.q.right === CALL && B.q.right === PUT);
+      for (let na = 1; na <= qmax; na++) for (let nb2 = 1; nb2 <= qmax; nb2++) {
+        const cost = na * A.cost + nb2 * B.cost;
+        if (cost > budget) continue;
+        const target = sig.beta * na * A.dd, hedged = target > 0 && Math.abs(nb2 * B.dd - target) / target <= cfg.options.max_hedge_mismatch;
+        let s = 0, wins = 0;
+        for (let i = 0; i < nPaths; i++) { const v = na * A.net[i] + nb2 * B.net[i] - cost; s += v; if (v > 0) wins++; }
+        const ev = s / nPaths;
+        entries.push({ score: ev / cost, cost, key: `${na}x ${qKey(A.q)} + ${nb2}x ${qKey(B.q)}`, ev, pop: wins / nPaths, aligned: directionOk && hedged, A, B, na, nb: nb2 });
+      }
+    }
+    entries.sort((x, y) => (y.score - x.score) || (x.cost - y.cost) || (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
+    const names = regimes.map(r => r[0]);
+    const legDict = (Lg, n) => ({ symbol: Lg.q.underlying, right: Lg.q.right, strike: Lg.q.strike, expiry: Lg.q.expiry, contracts: n, entry_price: Lg.buy, iv: Lg.q.iv, spot: Lg.spot, quote: Lg.q });
+    const full = r => {
+      const pnl = new Float64Array(nPaths);
+      for (let i = 0; i < nPaths; i++) pnl[i] = r.na * r.A.net[i] + r.nb * r.B.net[i] - r.cost;
+      const srt = Float64Array.from(pnl).sort(), n5 = Math.max(1, Math.ceil(0.05 * nPaths));
+      const mu = r.ev, byRegime = {};
+      let v2 = 0; for (const v of pnl) v2 += (v - mu) * (v - mu);
+      names.forEach((nm, ri) => { let s = 0, c = 0; for (let i = 0; i < nPaths; i++) if (reg[i] === ri) { s += pnl[i]; c++; } if (c) byRegime[nm] = s / c; });
+      let c5 = 0; for (let i = 0; i < n5; i++) c5 += srt[i];
+      return { key: r.key, legs: [legDict(r.A, r.na), legDict(r.B, r.nb)], cost: r.cost, ev: r.ev, pop: r.pop, score: r.score, aligned: r.aligned,
+               sd: Math.sqrt(v2 / nPaths), median: median(srt), p5: srt[n5 - 1], cvar5: c5 / n5, by_regime: byRegime, scenarios: [], payoff_grid: [], greeks: {} };
+    };
+    const top = entries.filter(r => r.aligned).slice(0, 5).map(full), overall = entries.slice(0, 5).map(full);
+    if (top.length) mcDeterministic(top[0], md, pair, sig, t, cfg);
+    const exitDays = Float64Array.from(tau).sort();
+    return {
+      pair, date: d0, z: sig.z, side,
+      calibration: { beta: sig.beta, beta_se: sig.beta_se, half_life: hl, phi, spread_sd: sd, daily_vol_b: sigmaB, correlation: sig.correlation, adf_t: sig.adf_t, history_days: nb },
+      regimes: regimes.map(([name, weight], i) => ({ name, weight, paths: counts[i] })), paths: nPaths, horizon: H,
+      converged_share: Array.from(tau).filter(v => v < H).length / nPaths, median_exit_day: median(exitDays),
+      legs: nLegs, combos: entries.length, top, overall, cloud: entries.map(r => [r.pop, r.score, r.aligned]), precedent: prec,
+    };
+  }
+  function mcDeterministic(c, md, pair, sig, t, cfg) {
+    const d0 = md.dates[t];
+    const legs = c.legs.map(lg => ({ symbol: lg.symbol, right: lg.right, contracts: lg.contracts, quote: lg.quote, spot: lg.spot, entry_price: lg.entry_price,
+      greeks: bsGreeks(lg.spot, lg.quote.strike, daysBetween(d0, lg.quote.expiry) / 365, md.rate, lg.quote.iv, lg.right) }));
+    const premium = sum(legs.map(l => l.entry_price * MULT * l.contracts)), entryFees = fees(sum(legs.map(l => l.contracts)), cfg.costs);
+    const p = { pair, signal: sig, quote_date: d0, legs, premium, entry_fees: entryFees, max_loss: premium + entryFees };
+    addScenarios(p, md.rate, cfg);
+    c.scenarios = p.scenarios.map(s => ({ name: s.name, when: s.when, pnl: s.pnl }));
+    c.payoff_grid = p.payoff_grid;
+    c.greeks = { delta_per_1pct: sum(legs.map(l => l.greeks.delta * l.spot * MULT * l.contracts)) / 100,
+                 theta_per_day: sum(legs.map(l => l.greeks.theta * MULT * l.contracts)), vega_per_point: sum(legs.map(l => l.greeks.vega * MULT * l.contracts)) };
+  }
+
   // ---------------------------------------------------------------- paper ledger (plain JSON object)
   class PaperError extends Error {}
   function newLedger(cfg) {
@@ -1161,7 +1337,7 @@ const Engine = (() => {
     makeSynthetic, fromSeries, loadCsv, exportCsv, parseCsv, truncated, assess, mdClose,
     computeSignal, signalSeries, ols, dickeyFuller, logs,
     slippage, buyPrice, sellPrice, fees, roundTripCost, checkLiquidity, checkParticipation, checkPortfolio, maxLossBudget,
-    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig,
+    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig, monteCarloPlan,
     newLedger, ledgerMarks, ledgerState, paperScan, paperConfirm, paperClose, PaperError,
     qKey, qDte, qMid, qSpread, qSpreadPct, daysBetween, addDays, weekday,
     LIVE_TRADING_AVAILABLE, submitLiveOrder,
@@ -1208,6 +1384,42 @@ if (typeof module !== "undefined") module.exports = Engine;
   };
   const PAGES_URL = "https://thanoscodemaster.github.io/pairs-lab-app/";
   const PRESETS = [["KO", "PEP"], ["XOM", "CVX"], ["V", "MA"], ["HD", "LOW"], ["JPM", "BAC"], ["MCD", "YUM"]];
+  const NAMES = { // company names for common tickers; others are looked up once (Finnhub) and remembered
+    KO: "Coca-Cola", PEP: "PepsiCo", KDP: "Keurig Dr Pepper", MNST: "Monster Beverage", XOM: "ExxonMobil", CVX: "Chevron", COP: "ConocoPhillips",
+    OXY: "Occidental", EOG: "EOG Resources", SLB: "SLB", HAL: "Halliburton", PSX: "Phillips 66", VLO: "Valero", MPC: "Marathon Petroleum",
+    V: "Visa", MA: "Mastercard", AXP: "American Express", PYPL: "PayPal", HD: "Home Depot", LOW: "Lowe's", JPM: "JPMorgan Chase",
+    BAC: "Bank of America", C: "Citigroup", WFC: "Wells Fargo", GS: "Goldman Sachs", MS: "Morgan Stanley", SCHW: "Charles Schwab", BLK: "BlackRock",
+    MCD: "McDonald's", YUM: "Yum! Brands", SBUX: "Starbucks", CMG: "Chipotle", QSR: "Restaurant Brands", DPZ: "Domino's",
+    AAPL: "Apple", MSFT: "Microsoft", GOOGL: "Alphabet", GOOG: "Alphabet", AMZN: "Amazon", META: "Meta", NVDA: "NVIDIA", AMD: "AMD", INTC: "Intel",
+    AVGO: "Broadcom", QCOM: "Qualcomm", TXN: "Texas Instruments", MU: "Micron", TSM: "TSMC", ORCL: "Oracle", CRM: "Salesforce", ADBE: "Adobe",
+    IBM: "IBM", CSCO: "Cisco", WMT: "Walmart", TGT: "Target", COST: "Costco", KR: "Kroger", DG: "Dollar General", DLTR: "Dollar Tree",
+    UPS: "UPS", FDX: "FedEx", BA: "Boeing", LMT: "Lockheed Martin", NOC: "Northrop Grumman", RTX: "RTX", GD: "General Dynamics",
+    PG: "Procter & Gamble", CL: "Colgate-Palmolive", KMB: "Kimberly-Clark", CLX: "Clorox", JNJ: "Johnson & Johnson", PFE: "Pfizer",
+    MRK: "Merck", ABBV: "AbbVie", BMY: "Bristol Myers Squibb", LLY: "Eli Lilly", UNH: "UnitedHealth", CVS: "CVS Health", CI: "Cigna",
+    T: "AT&T", VZ: "Verizon", TMUS: "T-Mobile", CMCSA: "Comcast", CHTR: "Charter", DIS: "Disney", NFLX: "Netflix", NKE: "Nike",
+    F: "Ford", GM: "General Motors", TSLA: "Tesla", CAT: "Caterpillar", DE: "Deere", MMM: "3M", GE: "GE Aerospace", HON: "Honeywell",
+    DAL: "Delta Air Lines", UAL: "United Airlines", AAL: "American Airlines", LUV: "Southwest", MAR: "Marriott", HLT: "Hilton",
+    BKNG: "Booking", EXPE: "Expedia", UBER: "Uber", LYFT: "Lyft", PM: "Philip Morris", MO: "Altria", MDLZ: "Mondelez", HSY: "Hershey",
+    GIS: "General Mills", K: "Kellanova", NEE: "NextEra Energy", DUK: "Duke Energy", SO: "Southern Company", D: "Dominion Energy",
+    SPY: "S&P 500 ETF", IVV: "iShares S&P 500", VOO: "Vanguard S&P 500", QQQ: "Nasdaq-100 ETF", DIA: "Dow ETF", IWM: "Russell 2000 ETF",
+    GLD: "SPDR Gold", IAU: "iShares Gold", SLV: "iShares Silver", XLE: "Energy SPDR", XLF: "Financials SPDR", XLK: "Technology SPDR",
+  };
+  const nameOf = sym => (local.get("names") || {})[sym] || NAMES[sym] || "";
+  const labelOf = sym => nameOf(sym) ? `${nameOf(sym)} (${sym})` : sym;
+  const pairLabel = p => `${labelOf(p[0])} / ${labelOf(p[1])}`;
+  async function ensureNames(syms) {
+    const key = local.get("fhkey"), cache = local.get("names") || {};
+    const missing = syms.filter(s => !NAMES[s] && !cache[s]);
+    if (!missing.length || !key || inClaude) return;
+    for (const s of missing) {
+      try {
+        const r = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(s)}&token=${encodeURIComponent(key)}`);
+        const n = ((await r.json()) || {}).name;
+        if (n) cache[s] = n.replace(/[,.]?\s+(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Holdings|Class [A-C])\.?$/i, "").replace(/[,.]?\s+(Inc|Corp|Co|Holdings)\.?$/i, "").trim();
+      } catch { /* keep the ticker */ }
+    }
+    local.set("names", cache); paint(true);
+  }
 
   // ------------------------------------------------------------ Twelve Data (history + today's 1-minute bars)
   class DataError extends Error { constructor(msg, kind = "other") { super(msg); this.kind = kind; } }
@@ -1304,7 +1516,7 @@ if (typeof module !== "undefined") module.exports = Engine;
   const S = {
     cfg: { ...E.defaultConfig() }, pair: prefs.pair || ["KO", "PEP"], custom: prefs.custom || [],
     status: "idle", error: null, hist: null, model: null, session: null, prev: null,
-    pts: [], last: {}, lastTick: 0, dirty: false, trade: null, tradeAt: 0, prec: null,
+    pts: [], last: {}, lastTick: 0, dirty: false, prec: null, mc: null, mcAt: 0, mcBusy: false, mcErr: null,
     sheet: null, watch: null, toast: null, loadId: 0,
   };
   const savedRisk = local.get("risk");
@@ -1338,7 +1550,7 @@ if (typeof module !== "undefined") module.exports = Engine;
   async function loadPair(a, b, { silent = false } = {}) {
     const id = ++S.loadId;
     S.pair = [a, b]; savePrefs();
-    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.trade = null; S.prec = null; S.model = null; paint(true); }
+    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.mc = null; S.mcErr = null; S.prec = null; S.model = null; paint(true); }
     try {
       const [ha, hb] = [await daily(a), await daily(b)];
       const [ia, ib] = [await tdBars(a, "1min", 390), await tdBars(b, "1min", 390)];
@@ -1390,17 +1602,23 @@ if (typeof module !== "undefined") module.exports = Engine;
   }, 2000);
   setInterval(() => { if (S.status === "ready") paint(); }, 15000); // keep "updated Xs ago" honest when quiet
 
-  // ------------------------------------------------------------ suggested trade when the drift passes the signal level
-  function updateTrade(force) {
-    if (!force && Date.now() - S.tradeAt < 30000) return;
-    S.tradeAt = Date.now();
-    const [a, b] = S.pair, z = zOf(S.last[a].p, S.last[b].p);
-    if (Math.abs(z) < S.cfg.signal.entry_z || !S.model.sig.eligible) { S.trade = null; return; }
-    const md = buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md, t = md.dates.length - 1;
-    const sig = E.computeSignal(E.logs(md.closes[a]), E.logs(md.closes[b]), t, S.cfg.signal, md.dates[t]);
-    if (!S.prec) S.prec = E.precedent(md, S.pair, S.cfg);
-    const eq = S.cfg.risk.starting_equity;
-    S.trade = E.propose(md, S.pair, sig, t, { equity: eq, peak_equity: eq, open_trades: 0, premium_at_risk: 0 }, E.precedentConfig(S.cfg, S.prec));
+  // ------------------------------------------------------------ options model: Monte Carlo over every call/put combination
+  const isSignal = () => S.status === "ready" && S.model.sig.eligible && Math.abs(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) >= S.cfg.signal.entry_z;
+  function updateTrade(force) { if (isSignal() && (force || !S.mc || Date.now() - S.mcAt > 60000)) runModel(); } // re-run at most once a minute
+  function runModel() {
+    if (S.status !== "ready" || S.mcBusy) return;
+    S.mcBusy = true; paint();
+    const id = S.loadId;
+    setTimeout(() => {
+      try {
+        const [a, b] = S.pair;
+        const md = buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md;
+        if (!S.prec) S.prec = E.precedent(md, S.pair, S.cfg);
+        const plan = E.monteCarloPlan(md, S.pair, S.cfg, null, 4000, S.prec);
+        if (id === S.loadId) { S.mc = plan; S.mcAt = Date.now(); S.mcErr = null; }
+      } catch (e) { if (id === S.loadId) S.mcErr = e.message; }
+      S.mcBusy = false; paint();
+    }, 40);
   }
 
   // ------------------------------------------------------------ watcher status line (ntfy), once a minute
@@ -1466,8 +1684,8 @@ if (typeof module !== "undefined") module.exports = Engine;
   }
 
   function viewPair() {
-    if (S.status === "loading") return `<section class="card empty"><span class="spin big-spin"></span><p class="note">Loading ${esc(S.pair.join(" / "))}…</p></section>`;
-    if (S.status === "error") return `<section class="card empty"><h3 class="mid">Couldn't load ${esc(S.pair.join(" / "))}</h3><p class="note">${esc(S.error.msg)}</p>
+    if (S.status === "loading") return `<section class="card empty"><span class="spin big-spin"></span><p class="note">Loading ${esc(pairLabel(S.pair))}…</p></section>`;
+    if (S.status === "error") return `<section class="card empty"><h3 class="mid">Couldn't load ${esc(pairLabel(S.pair))}</h3><p class="note">${esc(S.error.msg)}</p>
       <div class="row-btns">${S.error.kind === "key" ? `<button class="btn primary" data-act="sheet" data-s="settings">Open settings</button>` : ""}<button class="btn" data-act="retry">Try again</button></div></section>`;
     if (S.status !== "ready") return "";
     const [a, b] = S.pair, M = S.model, la = S.last[a].p, lb = S.last[b].p, z = zOf(la, lb), az = Math.abs(z), entry = S.cfg.signal.entry_z;
@@ -1491,27 +1709,88 @@ if (typeof module !== "undefined") module.exports = Engine;
         <div class="legend"><span><i class="zk z1"></i>Within 1σ (normal)</span><span><i class="zk z2"></i>1–2σ</span><span><i class="zk zo"></i>Beyond ${entry}σ: trade signal</span></div>
         ${unstable ? `<p class="note warn">This pair isn't moving together reliably right now (${esc(M.sig.reasons[0])}), so drift here isn't a signal.</p>` : ""}
       </section>
-      ${viewTrade(z)}`;
+      ${viewModel(z)}`;
   }
 
-  function viewTrade(z) {
-    const entry = S.cfg.signal.entry_z;
-    if (Math.abs(z) < entry || !S.trade) return `<section class="card quiet"><p class="note">A trade is suggested when the drift passes ±${entry}σ. Now ${zf(z)}σ${S.model.sig.eligible ? "" : ", and the pair is unstable"}.</p></section>`;
-    const r = S.trade;
-    if (r.type !== "proposal") return `<section class="card"><h3 class="mid">Beyond ${entry}σ, no trade fits</h3><p class="note">${esc(r.reasons[0])}</p></section>`;
-    const p = S.prec, conv = r.scenarios.find(s => s.name.startsWith("The gap closes completely"));
-    return `<section class="card signal">
-      <div class="head"><h3 class="mid">Suggested trade</h3><span class="pill down">Signal</span></div>
-      ${r.legs.map(l => `<div class="leg"><span class="tag ${l.right === "C" ? "call" : "put"}">${l.right === "C" ? "CALL" : "PUT"}</span>
-        <div><div class="t">Buy ${l.contracts} ${esc(l.symbol)} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}</div><div class="s">$${l.quote.strike} strike · expires ${dShort(l.quote.expiry)}</div></div>
-        <div class="r">${money(l.entry_price * 100 * l.contracts)}</div></div>`).join("")}
+  const legLine = l => `<div class="leg"><span class="tag ${l.right === "C" ? "call" : "put"}">${l.right === "C" ? "CALL" : "PUT"}</span>
+    <div><div class="t">Buy ${l.contracts} ${esc(l.symbol)} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}</div><div class="s">$${l.strike} strike · expires ${dShort(l.expiry)}</div></div>
+    <div class="r">${money(l.entry_price * 100 * l.contracts)}</div></div>`;
+  const comboName = c => c.legs.map(l => `${l.contracts} ${l.symbol} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""} $${l.strike}`).join(" + ");
+
+  function cloudChart(plan) { // every combination scored: win chance (x) vs expected return on the money at risk (y)
+    const Wc = 720, Hc = 260, pl = 52, pr = 14, pt = 12, pb = 34, best = plan.top[0], lead = plan.overall[0];
+    const ys = plan.cloud.map(p => p[1]);
+    let lo = Math.min(0, ...ys), hi = Math.max(0, ...ys); const pad = (hi - lo) * 0.08 || 0.1; lo -= pad; hi += pad;
+    const X = v => pl + (Wc - pl - pr) * v, Y = v => pt + (Hc - pt - pb) * (1 - (v - lo) / (hi - lo));
+    const step = Math.max(1, Math.ceil(plan.cloud.length / 2500));
+    let dots = "", hot = "";
+    plan.cloud.forEach((p, i) => {
+      if (p[2]) hot += `<circle class="cd-pair" cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.6"/>`;
+      else if (i % step === 0) dots += `<circle class="cd" cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2"/>`;
+    });
+    let s = `<svg class="chart" viewBox="0 0 ${Wc} ${Hc}" role="img" aria-label="All combinations: win chance against expected return">`;
+    for (const v of [0, 0.25, 0.5, 0.75, 1]) s += `<line class="band-l" x1="${X(v)}" x2="${X(v)}" y1="${pt}" y2="${Hc - pb}"/><text x="${X(v)}" y="${Hc - 18}" text-anchor="middle">${v * 100}%</text>`;
+    s += `<line class="zero" x1="${pl}" x2="${Wc - pr}" y1="${Y(0)}" y2="${Y(0)}"/>`;
+    for (const v of [hi - pad, 0, lo + pad]) s += `<text x="${pl - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${pct(v, 0)}</text>`;
+    s += dots + hot;
+    if (lead && !lead.aligned) s += `<rect class="cd-lead" x="${(X(lead.pop) - 6).toFixed(1)}" y="${(Y(lead.score) - 6).toFixed(1)}" width="12" height="12" transform="rotate(45 ${X(lead.pop).toFixed(1)} ${Y(lead.score).toFixed(1)})"/>`;
+    if (best) s += `<circle class="cd-best" cx="${X(best.pop).toFixed(1)}" cy="${Y(best.score).toFixed(1)}" r="8"/>`;
+    s += `<text x="${(pl + Wc - pr) / 2}" y="${Hc - 2}" text-anchor="middle">Win chance →</text>`;
+    return s + "</svg>";
+  }
+
+  function viewModel(z) {
+    const entry = S.cfg.signal.entry_z, signal = isSignal(), plan = S.mc;
+    const head = `<div class="head"><div><h3 class="mid">Options model</h3><div class="small muted">Monte Carlo · every call/put combination</div></div>
+      ${signal ? `<span class="pill down">Signal</span>` : `<span class="pill">No signal</span>`}</div>`;
+    if (!plan) return `<section class="card${S.mcBusy ? "" : " quiet"}">${head}
+      ${S.mcBusy ? `<p class="note"><span class="spin"></span>Simulating 4,000 markets and scoring every combination…</p>` : `
+      <p class="note">${signal ? "Preparing…" : `Runs automatically when the drift passes ±${entry}σ (now ${zf(z)}σ${S.model.sig.eligible ? "" : ", and the pair is unstable"}).`}</p>
+      ${S.mcErr ? `<p class="note warn">${esc(S.mcErr)}</p>` : ""}
+      <div><button class="btn sm" data-act="run-model">Run the model now</button></div>`}</section>`;
+    const c = plan.top[0], lead = plan.overall[0], cal = plan.calibration, prec = plan.precedent;
+    const summary = `Scored <b>${plan.combos.toLocaleString()}</b> call/put combinations across <b>${plan.paths.toLocaleString()}</b> simulated markets
+      (${plan.regimes.length} regimes, next ${plan.horizon} trading days) at drift ${zf(plan.z)}σ · ${esc(ago(S.mcAt))}${S.mcBusy ? ` · <span class="spin"></span>updating` : ""}`;
+    if (!c) return `<section class="card">${head}<p class="note">${summary}.</p>
+      <p class="note warn">No balanced pairs trade fits your risk limit (max ${money(S.cfg.risk.max_loss_per_trade_pct * S.cfg.risk.starting_equity)} per trade).</p></section>`;
+    const maxAbs = Math.max(...Object.values(c.by_regime).map(Math.abs), 1);
+    const regimes = plan.regimes.map(r => {
+      const v = c.by_regime[r.name] ?? 0, w = Math.abs(v) / maxAbs * 50;
+      return `<div class="bar"><div>${esc(r.name)}<small>${pct(r.weight, 0, false)} of paths</small></div>
+        <div class="track"><i style="left:${v >= 0 ? 50 : 50 - w}%;width:${w}%;background:var(${v >= 0 ? "--up" : "--down"})"></i><span class="zero-l"></span></div>
+        <div class="val ${v >= 0 ? "up" : "down"}">${money(v, true)}</div></div>`;
+    }).join("");
+    const det = c.scenarios.map(s => `<div class="item" style="cursor:default"><span><span class="t">${esc(s.name)}</span><span class="s">${esc(s.when)}</span></span>
+      <span class="r ${s.pnl >= 0 ? "up" : "down"}">${money(s.pnl, true)}</span></div>`).join("");
+    return `<section class="card ${signal ? "signal" : ""}">${head}
+      <p class="note">${summary}</p>
+      <div class="label">Best pairs trade</div>
+      ${c.legs.map(legLine).join("")}
       <div class="stats">
-        <div class="stat"><span class="label">Max loss</span><span class="v">${money(r.max_loss)}</span></div>
-        <div class="stat"><span class="label">If the gap closes · 2 wks</span><span class="v ${conv.pnl >= 0 ? "up" : "down"}">${money(conv.pnl, true)}</span></div>
+        <div class="stat"><span class="label">Max loss</span><span class="v">${money(c.cost)}</span></div>
+        <div class="stat"><span class="label">Win chance</span><span class="v">${pct(c.pop, 0, false)}</span></div>
+        <div class="stat"><span class="label">Expected P&amp;L</span><span class="v ${c.ev >= 0 ? "up" : "down"}">${money(c.ev, true)}</span></div>
+        <div class="stat"><span class="label">Expected return</span><span class="v ${c.score >= 0 ? "up" : "down"}">${pct(c.score, 0)}</span></div>
+        <div class="stat"><span class="label">Median outcome</span><span class="v ${c.median >= 0 ? "up" : "down"}">${money(c.median, true)}</span></div>
+        <div class="stat"><span class="label">Worst 5% (avg)</span><span class="v down">${money(c.cvar5, true)}</span></div>
       </div>
-      ${conv.pnl < 0 ? `<p class="note warn">Time decay and costs outweigh the expected gain. Consider skipping.</p>` : ""}
-      ${p && p.n ? `<p class="note${p.thin ? " warn" : ""}">Precedent: ${p.closed} of ${p.n} past drifts closed${p.median_days != null ? `, typically in ${plural(Math.round(p.median_days), "trading day")}` : ""}.</p>` : ""}
-      <p class="note">Option prices are modeled. Check live quotes before trading. Not financial advice.</p>
+      ${c.ev <= 0 ? `<p class="note warn">Even the best balanced combination loses money on average in these simulations. Consider skipping this one.</p>` : ""}
+      <div><div class="label">Outcome by market regime</div><div class="bars">${regimes}</div></div>
+      <div><div class="label">All ${plan.combos.toLocaleString()} combinations</div>${cloudChart(plan)}
+        <div class="legend"><span><i class="cdk best"></i>Suggested</span><span><i class="cdk pair"></i>Balanced pairs trades</span><span><i class="cdk"></i>Other combinations</span>${lead && !lead.aligned ? `<span><i class="cdk lead"></i>Top overall</span>` : ""}</div></div>
+      ${lead && !lead.aligned && lead.score > c.score ? `<p class="note">Highest-scoring overall: <b>${esc(comboName(lead))}</b> (${pct(lead.score, 0)} expected return). It's a bet on the market's direction, not a hedged pairs trade, so it isn't suggested.</p>` : ""}
+      <details><summary>Fixed scenarios for the suggested trade</summary><div class="list">${det}</div>
+        <p class="note">Greeks: ${money(c.greeks.delta_per_1pct, true)} per 1% move in both stocks · time decay ${money(c.greeks.theta_per_day, true)}/day · ${money(c.greeks.vega_per_point, true)} per volatility point.</p></details>
+      ${plan.top.length > 1 ? `<details><summary>Runners-up</summary><div class="list">${plan.top.slice(1).map(r => `<div class="item" style="cursor:default"><span><span class="t">${esc(comboName(r))}</span><span class="s">max loss ${money(r.cost)} · win chance ${pct(r.pop, 0, false)}</span></span><span class="r ${r.ev >= 0 ? "up" : "down"}">${money(r.ev, true)}</span></div>`).join("")}</div></details>` : ""}
+      <details><summary>Model inputs</summary><p class="note">
+        Hedge ratio ${cal.beta.toFixed(2)} (±${(2 * cal.beta_se).toFixed(2)}) · gap half-life ${Number.isFinite(cal.half_life) ? cal.half_life.toFixed(1) + " days" : "none"} · correlation ${cal.correlation.toFixed(2)} · Dickey-Fuller t ${cal.adf_t.toFixed(2)} ·
+        ${esc(S.pair[1])} daily volatility ${pct(cal.daily_vol_b, 2, false)} · ${cal.history_days} historical days replayed.<br>
+        Regimes: ${plan.regimes.map(r => `${esc(r.name)} ${pct(r.weight, 0, false)}`).join(", ")}.<br>
+        ${prec && prec.n ? `Precedent: ${prec.closed} of ${prec.n} past drifts closed${prec.median_days != null ? `, median ${Math.round(prec.median_days)} trading days` : ""}. ` : ""}
+        In the simulations the gap closed within ${plan.horizon} days on ${pct(plan.converged_share, 0, false)} of paths (median exit day ${plan.median_exit_day}).
+        Only bought options are considered, so the max loss is what you pay.</p></details>
+      <p class="note">Option prices are modeled and the regimes are assumptions. Check live quotes before trading. Not financial advice.</p>
+      <div><button class="btn sm" data-act="run-model">Re-run</button></div>
     </section>`;
   }
 
@@ -1563,7 +1842,7 @@ if (typeof module !== "undefined") module.exports = Engine;
         <header class="top"><div class="top-in">
           <span class="brand">Pairs Lab</span>
           <div class="select-wrap"><select id="pair-select" aria-label="Pair">
-            ${groups.map(g => `<optgroup label="${esc(g)}">${list.filter(x => x.group === g).map(x => `<option value="${esc(key(x.p))}" ${key(x.p) === key(S.pair) ? "selected" : ""}>${esc(x.p.join(" / "))}</option>`).join("")}</optgroup>`).join("")}
+            ${groups.map(g => `<optgroup label="${esc(g)}">${list.filter(x => x.group === g).map(x => `<option value="${esc(key(x.p))}" ${key(x.p) === key(S.pair) ? "selected" : ""}>${esc(pairLabel(x.p))}</option>`).join("")}</optgroup>`).join("")}
             <option value="__add">+ Add a pair…</option></select></div>
           <button class="icon-btn" data-act="sheet" data-s="settings" aria-label="Settings">${ICON.gear}</button>
         </div></header>
@@ -1596,10 +1875,12 @@ if (typeof module !== "undefined") module.exports = Engine;
     if (act === "sheet") { S.sheet = el.dataset.s; paint(); }
     else if (act === "sheet-close" || act === "scrim") { S.sheet = null; paint(); }
     else if (act === "retry") loadPair(...S.pair);
+    else if (act === "run-model") runModel();
     else if (act === "add-pair") {
       const a = document.getElementById("add-a").value.trim().toUpperCase(), b = document.getElementById("add-b").value.trim().toUpperCase();
       if (!/^[A-Z.\-]{1,10}$/.test(a) || !/^[A-Z.\-]{1,10}$/.test(b) || a === b) { toast("Enter two different tickers"); return; }
       if (!S.custom.some(p => key(p) === key([a, b]))) S.custom.push([a, b]);
+      ensureNames([a, b]);
       S.sheet = null; savePrefs(); loadPair(a, b);
     } else if (act === "save-settings") {
       const val = id => ((document.getElementById(id) || {}).value || "").trim();
@@ -1626,6 +1907,7 @@ if (typeof module !== "undefined") module.exports = Engine;
   paint(true);
   if (inClaude || local.get("tdkey")) loadPair(...S.pair);
   fetchWatch();
+  ensureNames([...new Set(pairList().flatMap(x => x.p))]);
   setInterval(fetchWatch, 60000);
   if (inClaude) setInterval(() => { if (S.status === "ready" && document.visibilityState === "visible") loadPair(...S.pair, { silent: true }); }, 60000);
 })();
