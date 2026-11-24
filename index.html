@@ -161,6 +161,39 @@ main { max-width: 760px; margin: 0 auto; display: grid; gap: 14px; padding-block
 @keyframes spin { to { transform: rotate(360deg); } }
 .foot { text-align: center; font-size: .78rem; color: var(--faint); }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+/* ---------- live single page ---------- */
+.select-wrap { position: relative; flex: 1; min-width: 0; max-width: 320px; }
+.select-wrap::after { content: ""; position: absolute; right: 14px; top: 50%; width: 8px; height: 8px; margin-top: -6px;
+  border-right: 2px solid var(--ink); border-bottom: 2px solid var(--ink); transform: rotate(45deg); pointer-events: none; }
+#pair-select { width: 100%; appearance: none; -webkit-appearance: none; border: 0; background: var(--chip); color: var(--ink);
+  border-radius: 999px; padding: 10px 38px 10px 16px; font-weight: 800; font-size: 1rem; cursor: pointer; }
+.quotes { display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.quotes > div { display: flex; align-items: baseline; gap: 8px; }
+.sym { font-weight: 800; font-size: .95rem; display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; width: 12px; height: 3px; border-radius: 2px; }
+.sw.a { background: var(--line-a); } .sw.b { background: var(--line-b); }
+.px { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.pill.pulse::before { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+.pill.warn-pill { border: 0; cursor: pointer; background: var(--drift-soft); color: var(--drift); font: inherit; font-weight: 700; font-size: .82rem; }
+.zone-1 { fill: color-mix(in srgb, var(--up) 9%, transparent); }
+.zone-2 { fill: color-mix(in srgb, var(--drift) 14%, transparent); }
+.zone-out { fill: color-mix(in srgb, var(--down) 10%, transparent); }
+.band-l { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
+.dot.b { fill: var(--line-b); }
+.dot.live { animation: pulse 1.6s ease-in-out infinite; }
+.chart .tag-a { fill: var(--ink); font-weight: 800; }
+.zk { display: inline-block; width: 12px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.zk.z1 { background: color-mix(in srgb, var(--up) 22%, transparent); }
+.zk.z2 { background: color-mix(in srgb, var(--drift) 30%, transparent); }
+.zk.zo { background: color-mix(in srgb, var(--down) 24%, transparent); }
+.card.signal { box-shadow: inset 0 0 0 2px var(--down); }
+.card.quiet { padding: 14px 20px; }
+.big-spin { width: 24px; height: 24px; border-width: 3px; }
+.foot a { color: inherit; }
+@media (prefers-reduced-motion: reduce) { .pill.pulse::before, .dot.live { animation: none; } }
+@media (max-width: 560px) { .px { font-size: 1.15rem; } .brand { display: none; } .select-wrap { max-width: none; } }
 </style>
 </head><body>
 <div id="app"><p style="padding:24px;font:16px system-ui">Loading Pairs Lab…</p></div>
@@ -1137,8 +1170,9 @@ const Engine = (() => {
 if (typeof module !== "undefined") module.exports = Engine;
 </script>
 <script>
-/* Pairs Lab interface: Analyze (pick pair + period, see drift, get the trade) and
-   Positions (monitor until it's time to close). All maths lives in engine.js. */
+/* Pairs Lab: one live page. Pick a pair; watch both stocks and their drift (in standard
+   deviations) update with every trade; see the suggested calls/puts when the drift passes 2σ.
+   History and the σ model: Twelve Data. Live trades: Finnhub stream. Maths: engine.js. */
 "use strict";
 (() => {
   const E = Engine;
@@ -1150,746 +1184,450 @@ if (typeof module !== "undefined") module.exports = Engine;
   const minus = s => s.replace("-", "−");
   const money = (v, sign = false) => bad(v) ? "–" : (sign && v > 0 ? "+" : "") + (v < 0 ? "−" : "") + "$" + Math.abs(Math.round(v)).toLocaleString("en-US");
   const cents = v => bad(v) ? "–" : "$" + v.toFixed(2);
-  const pct = (v, d = 1, sign = false) => bad(v) ? "–" : (sign && v > 0 ? "+" : "") + minus((v * 100).toFixed(d)) + "%";
-  const zf = z => bad(z) ? "–" : (z > 0 ? "+" : "") + minus(z.toFixed(1));
-  const dLong = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
-  const dShort = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
-  const dMon = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", year: "2-digit", timeZone: "UTC" });
-  const todayISO = () => new Date().toISOString().slice(0, 10);
+  const pct = (v, d = 2, sign = true) => bad(v) ? "–" : (sign && v > 0 ? "+" : "") + minus((v * 100).toFixed(d)) + "%";
+  const zf = z => bad(z) ? "–" : (z > 0 ? "+" : "") + minus(z.toFixed(2));
   const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-  const ICON = {
-    gear: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
-    info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
-  };
+  const dShort = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+  const dDay = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+  const NYF = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+  function nyParts(ms) { // {day: "YYYY-MM-DD", min: minutes since midnight New York (with seconds as fraction)}
+    const p = Object.fromEntries(NYF.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+    return { day: `${p.year}-${p.month}-${p.day}`, min: +p.hour * 60 + +p.minute + +p.second / 60 };
+  }
+  const OPEN = 570, CLOSE = 960; // 9:30 and 16:00 New York
+  const hm = m => `${Math.floor(m / 60)}:${String(Math.floor(m % 60)).padStart(2, "0")}`;
+  const ago = ms => { const s = Math.round((Date.now() - ms) / 1000); return s < 5 ? "now" : s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  const ICON = { gear: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>' };
 
-  // ------------------------------------------------------------ storage: claude.ai account, else this browser
-  const caps = window.claude && typeof window.claude.use === "function"
-    ? { db: window.claude.use("db").catch(() => null), user: window.claude.use("user").catch(() => null), mcp: window.claude.use("mcp").catch(() => null) }
-    : null;
-  const inClaude = !!caps;
+  // ------------------------------------------------------------ storage (this browser)
+  const caps = window.claude && typeof window.claude.use === "function" ? { mcp: window.claude.use("mcp").catch(() => null) } : null;
+  const inClaude = !!caps; // claude.ai pages can't open live streams or call outside sites; they use the Twelve Data connector
   const local = {
-    ok: (() => { try { localStorage.setItem("pl.t", "1"); localStorage.removeItem("pl.t"); return true; } catch { return false; } })(),
     get(k) { try { const v = localStorage.getItem("pairslab." + k); return v ? JSON.parse(v) : null; } catch { return null; } },
     set(k, v) { try { localStorage.setItem("pairslab." + k, JSON.stringify(v)); return true; } catch { return false; } },
   };
-  const Store = {
-    mode: local.ok ? "browser" : "memory", db: null, uid: null, queue: Promise.resolve(),
-    async init() {
-      if (!caps) return;
-      const [db, user] = await Promise.all([caps.db, caps.user]);
-      const uid = user ? await user.id() : null;
-      if (db && uid) { this.db = db; this.uid = uid; this.mode = "account"; }
-    },
-    async load(key) {
-      if (this.mode === "account") {
-        try { const s = await this.db.doc(`data/users/${this.uid}/${key}`).get(); return s.exists ? JSON.parse(JSON.stringify(s.data())) : null; }
-        catch { this.mode = local.ok ? "browser" : "memory"; }
-      }
-      return local.get(key);
-    },
-    save(key, value) {
-      this.queue = this.queue.then(async () => {
-        if (this.mode === "account") {
-          try { await this.db.doc(`data/users/${this.uid}/${key}`).set(value); return; }
-          catch { this.mode = local.ok ? "browser" : "memory"; }
-        }
-        if (this.mode === "browser") local.set(key, value);
-      });
-      return this.queue;
-    },
-  };
-
-  // ------------------------------------------------------------ real prices (Twelve Data, licensed to the user)
-  const TD_SERVER = "Twelve Data", TD_TOOL = "get_time_series";
+  const PAGES_URL = "https://thanoscodemaster.github.io/pairs-lab-app/";
   const PRESETS = [["KO", "PEP"], ["XOM", "CVX"], ["V", "MA"], ["HD", "LOW"], ["JPM", "BAC"], ["MCD", "YUM"]];
-  const PERIODS = [["6M", 126], ["1Y", 252], ["2Y", 504], ["5Y", 1260]];
+
+  // ------------------------------------------------------------ Twelve Data (history + today's 1-minute bars)
   class DataError extends Error { constructor(msg, kind = "other") { super(msg); this.kind = kind; } }
-  function parseTd(payload) {
+  function parseBars(payload) { // -> [[datetime, close], ...] oldest first; works for REST JSON and the connector's text
     if (payload && typeof payload === "object" && !Array.isArray(payload) && typeof payload.result === "string") payload = payload.result;
+    let rows = [];
     if (typeof payload === "string") {
       const t = payload.trim();
       if (/^error\b/i.test(t)) {
         const msg = t.replace(/^error:?\s*/i, "").replace(/\*\*/g, "");
-        if (/symbol|figi/i.test(msg)) throw new DataError("Ticker not found. Use US symbols like KO or PEP.", "symbol");
-        if (/credit|limit/i.test(msg)) throw new DataError("Daily data limit reached. Try again later.", "rate");
-        throw new DataError(msg);
+        throw new DataError(/symbol|figi/i.test(msg) ? "Ticker not found. Use US symbols like KO or PEP." : /credit|limit/i.test(msg) ? "Twelve Data limit reached. Wait a minute." : msg, /symbol/i.test(msg) ? "symbol" : "other");
       }
       if (/^datetime[;,]/i.test(t)) {
         const lines = t.split(/\r?\n/), head = lines[0].split(/[;,]/).map(h => h.trim().toLowerCase());
-        const iD = head.indexOf("datetime"), iC = head.indexOf("close"), series = {};
-        for (const line of lines.slice(1)) {
-          const f = line.split(/[;,]/), d = (f[iD] || "").slice(0, 10), c = Number(f[iC]);
-          if (c > 0 && /^\d{4}-\d{2}-\d{2}$/.test(d)) series[d] = c;
-        }
-        if (!Object.keys(series).length) throw new DataError("No prices for that ticker.", "symbol");
-        return { series, last: Object.keys(series).sort().pop() };
-      }
-      try { payload = JSON.parse(t); } catch { throw new DataError(t.slice(0, 200)); }
+        const iD = head.indexOf("datetime"), iC = head.indexOf("close");
+        rows = lines.slice(1).map(l => l.split(/[;,]/)).map(f => [f[iD], Number(f[iC])]);
+      } else payload = JSON.parse(t);
     }
-    if (payload && typeof payload === "object") {
-      const values = Array.isArray(payload) ? payload : payload.values;
-      if (Array.isArray(values)) {
-        const series = {};
-        for (const v of values) { const c = Number(v.close), d = String(v.datetime || "").slice(0, 10); if (c > 0 && /^\d{4}-\d{2}-\d{2}$/.test(d)) series[d] = c; }
-        if (!Object.keys(series).length) throw new DataError("No prices for that ticker.", "symbol");
-        return { series, last: Object.keys(series).sort().pop() };
-      }
-      if (payload.status === "error" || payload.message) {
+    if (payload && typeof payload === "object" && !rows.length) {
+      if (payload.status === "error" || (payload.code && !payload.values)) {
         const code = Number(payload.code);
-        if (code === 401) throw new DataError("Twelve Data didn't accept your key.", "key");
-        if (code === 429) throw new DataError("Data limit reached (8 a minute, 800 a day). Wait a minute.", "rate");
-        if (code === 400 || code === 404) throw new DataError("Ticker not found. Use US symbols like KO or PEP.", "symbol");
-        throw new DataError(String(payload.message || "Twelve Data reported an error."));
+        throw new DataError(code === 401 ? "Twelve Data didn't accept your key. Check it in settings." : code === 429 ? "Twelve Data limit reached (8 a minute). Wait a minute." :
+          code === 400 || code === 404 ? "Ticker not found. Use US symbols like KO or PEP." : String(payload.message || "Twelve Data error"), code === 401 ? "key" : "other");
       }
+      rows = (payload.values || []).map(v => [v.datetime, Number(v.close)]);
     }
-    throw new DataError("Unexpected response from Twelve Data.");
+    rows = rows.filter(r => r[0] && r[1] > 0);
+    if (!rows.length) throw new DataError("No prices returned for that ticker.", "symbol");
+    return rows.sort((x, y) => (x[0] < y[0] ? -1 : 1));
   }
-  const MCP_HELP = {
-    server_not_connected: "Connect Twelve Data in claude.ai → Settings → Connectors, then try again.",
-    needs_reauth: "Reconnect Twelve Data in claude.ai → Settings → Connectors.",
-    not_in_manifest: "Allow Pairs to use Twelve Data when claude.ai asks.",
-    approval_required: "Allow Pairs to use Twelve Data when claude.ai asks.",
-    consent_required: "Allow Pairs to use Twelve Data when claude.ai asks.",
-    selection_required: "Choose which Twelve Data connector to use when claude.ai asks.",
-    blocked_by_policy: "Your organization blocks this connector.",
-    not_granted: "Real prices can't load in this view.",
-    capability_disabled: "Real prices can't load in this view.",
-  };
-  async function fetchDaily(sym) {
+  async function tdBars(sym, interval, outputsize) {
     if (inClaude) {
       const mcp = await caps.mcp;
-      if (!mcp) throw new DataError(MCP_HELP.not_granted);
-      const input = { symbol: sym, interval: "1day", outputsize: 1600 };
-      let res;
-      try { res = await mcp.callTool(TD_SERVER, TD_TOOL, input, { cache: { staleTime: 60000, gcTime: 86400000 } }); }
-      catch (e) {
-        if (e && e.retryable) {
-          await new Promise(r => setTimeout(r, Math.min(e.retryAfterMs || 1500 + Math.random() * 1000, 8000)));
-          try { res = await mcp.callTool(TD_SERVER, TD_TOOL, input); } catch (e2) { e = e2; }
-        }
-        if (!res) throw new DataError((e && MCP_HELP[e.code]) || (e && e.code === "server_unavailable" ? "Twelve Data isn't responding. Try again in a minute." : `Couldn't reach Twelve Data${e && e.message ? `: ${e.message}` : ""}.`), "mcp");
+      if (!mcp) throw new DataError("Prices can't load in this view.");
+      try {
+        const res = await mcp.callTool("Twelve Data", "get_time_series", { symbol: sym, interval, outputsize }, { cache: { staleTime: 30000, gcTime: 3600000 } });
+        const text = (res.content || []).find(c => c.type === "text");
+        return parseBars(res.payload != null ? res.payload : text && text.text);
+      } catch (e) {
+        if (e instanceof DataError) throw e;
+        throw new DataError(e && e.code === "server_not_connected" ? "Connect Twelve Data in claude.ai → Settings → Connectors." : `Couldn't reach Twelve Data${e && e.message ? `: ${e.message}` : ""}.`);
       }
-      const text = (res.content || []).find(c => c.type === "text");
-      return parseTd(res.payload != null ? res.payload : text && text.text);
     }
     const key = local.get("tdkey");
-    if (!key) throw new DataError("Add your free Twelve Data key to load real prices.", "key");
+    if (!key) throw new DataError("Add your Twelve Data key.", "key");
     let r;
-    try { r = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=1day&outputsize=1600&apikey=${encodeURIComponent(key)}`); }
+    try { r = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${interval}&outputsize=${outputsize}&apikey=${encodeURIComponent(key)}`); }
     catch { throw new DataError("Couldn't reach Twelve Data. Check your connection."); }
-    return parseTd(await r.json());
+    return parseBars(await r.json());
   }
-  async function getSeries(sym, refresh) {
-    const cached = local.get("td." + sym);
-    if (cached && (!refresh || Date.now() - cached.fetchedAt < 60000)) return cached;
-    let got;
-    try { got = await fetchDaily(sym); } catch (e) { e.message = `${sym}: ${e.message}`; throw e; }
-    const { series, last } = got;
-    const trimmed = {};
-    for (const d of Object.keys(series).sort().slice(-1600)) trimmed[d] = series[d];
-    const entry = { fetchedAt: Date.now(), last, series: trimmed };
-    local.set("td." + sym, entry);
-    return entry;
-  }
-  function buildReal(a, b, ca, cb) {
-    const md = E.fromSeries({ [a]: ca.series, [b]: cb.series }, { rate: S.cfg.data.risk_free_rate, meta: {
-      source: "Twelve Data", license_note: "Your Twelve Data account (personal use)", delay_note: "Daily prices" } });
-    if (md.dates.length < S.cfg.signal.lookback + 30) throw new DataError(`Not enough shared history for ${a} and ${b}.`);
-    md.fetchedAt = Math.min(ca.fetchedAt, cb.fetchedAt);
-    return md;
+  async function daily(sym) { // cached ~6 years of daily closes, refreshed twice a day
+    const c = local.get("td." + sym);
+    if (c && Date.now() - c.fetchedAt < 12 * 3600 * 1000) return c.series;
+    const series = {};
+    for (const [d, v] of await tdBars(sym, "1day", 1600)) series[d.slice(0, 10)] = v;
+    local.set("td." + sym, { fetchedAt: Date.now(), last: Object.keys(series).sort().pop(), series });
+    return series;
   }
 
-  // ------------------------------------------------------------ cloud watcher status (posted to a silent ntfy topic after every check)
-  const PAGES_URL = "https://thanoscodemaster.github.io/pairs-lab-app/";
-  async function fetchStatus() {
-    const topic = local.get("ntfytopic");
-    if (!topic) return;
-    S.watch.loading = true; render();
-    try {
-      const r = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}-status/json?poll=1&since=latest`);
-      if (!r.ok) throw new Error(`ntfy answered ${r.status}`);
-      const msgs = (await r.text()).trim().split("\n").filter(Boolean).map(l => JSON.parse(l)).filter(m => m.event === "message");
-      if (!msgs.length) { S.watch.status = null; S.watch.error = "No status yet. It appears after the watcher's next run (within 6 hours, or every 10 minutes while the market is open)."; }
-      else { S.watch.status = JSON.parse(msgs[msgs.length - 1].message); S.watch.error = null; }
-      S.watch.fetchedAt = Date.now();
-    } catch (e) { S.watch.error = `Couldn't read the watcher status: ${e.message}`; }
-    S.watch.loading = false; render();
-  }
-  const ago = iso => {
-    const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
-    return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
+  // ------------------------------------------------------------ Finnhub live trade stream
+  const Live = {
+    ws: null, want: [], state: "off", msg: "", retry: null,
+    connect() {
+      const key = local.get("fhkey");
+      if (inClaude || !key) { this.state = "off"; return; }
+      if (this.ws && this.ws.readyState <= 1) return;
+      this.state = "connecting";
+      const ws = this.ws = new WebSocket(`wss://ws.finnhub.io?token=${encodeURIComponent(key)}`);
+      ws.onopen = () => { this.state = "open"; this.msg = ""; for (const s of this.want) ws.send(JSON.stringify({ type: "subscribe", symbol: s })); paint(); };
+      ws.onmessage = ev => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.type === "trade") for (const d of m.data || []) onTrade(d.s, d.p, d.t);
+        else if (m.type === "error") { this.msg = m.msg || "Stream error"; paint(); }
+      };
+      ws.onclose = () => {
+        this.state = "closed"; paint();
+        clearTimeout(this.retry);
+        if (this.want.length) this.retry = setTimeout(() => this.connect(), 5000);
+      };
+      ws.onerror = () => { this.msg = "Couldn't connect to Finnhub. Check your key in settings."; };
+    },
+    watch(symbols) {
+      const ws = this.ws, open = ws && ws.readyState === 1;
+      for (const s of this.want) if (!symbols.includes(s) && open) ws.send(JSON.stringify({ type: "unsubscribe", symbol: s }));
+      for (const s of symbols) if (!this.want.includes(s) && open) ws.send(JSON.stringify({ type: "subscribe", symbol: s }));
+      this.want = [...symbols];
+      this.connect();
+    },
+    reset() { if (this.ws) { this.ws.onclose = null; this.ws.close(); } this.ws = null; this.state = "off"; this.connect(); },
   };
 
   // ------------------------------------------------------------ state
-  const prefs = local.get("prefs2") || {};
+  const prefs = local.get("prefs3") || {};
   const S = {
-    view: "analyze", cfg: E.defaultConfig(), ledger: null,
-    pick: prefs.pick || ["KO", "PEP"], period: prefs.period || "1Y",
-    source: "demo", pair: ["SYNA", "SYNB"], full: null, asOf: null, md: null, an: null,
-    chart: "prices", open: null, sheet: null, busy: null, error: null, toast: null,
-    watch: { status: null, error: null, loading: false, fetchedAt: 0 },
+    cfg: { ...E.defaultConfig() }, pair: prefs.pair || ["KO", "PEP"], custom: prefs.custom || [],
+    status: "idle", error: null, hist: null, model: null, session: null, prev: null,
+    pts: [], last: {}, lastTick: 0, dirty: false, trade: null, tradeAt: 0, prec: null,
+    sheet: null, watch: null, toast: null, loadId: 0,
   };
-  S.ledger = E.newLedger(S.cfg);
-  const savePrefs = () => local.set("prefs2", { pick: S.pick, period: S.period, source: S.source });
-  const saveLedger = () => { const { pending, ...rest } = S.ledger; rest.log = rest.log.slice(-200); return Store.save("ledger", rest); };
-  const latest = () => S.full.dates[S.full.dates.length - 1];
-  const replaying = () => S.asOf < latest();
-
-  // ------------------------------------------------------------ analysis
-  function setAsOf(d) {
-    const ds = S.full.dates;
-    let i = ds.length - 1;
-    while (i > 0 && ds[i] > d) i--;
-    S.asOf = ds[i];
-    S.md = E.truncated(S.full, S.asOf);
-    analyze();
+  const savedRisk = local.get("risk");
+  if (savedRisk) S.cfg = { ...S.cfg, signal: { ...S.cfg.signal, ...(savedRisk.signal || {}) }, risk: { ...S.cfg.risk, ...(savedRisk.risk || {}) } };
+  const savePrefs = () => local.set("prefs3", { pair: S.pair, custom: S.custom });
+  const key = p => p.join("/");
+  function pairList() {
+    const seen = new Set(), out = [];
+    const add = (p, group) => { const k = key(p); if (!seen.has(k)) { seen.add(k); out.push({ p, group }); } };
+    for (const p of (S.watch && S.watch.pairs || []).map(x => x.p.split("/"))) add(p, "Watcher");
+    for (const p of S.custom) add(p, "My pairs");
+    for (const p of PRESETS) add(p, "Popular");
+    add(S.pair, "My pairs");
+    return out;
   }
-  function stepDay(k) { const i = S.full.dates.indexOf(S.asOf) + k; if (i >= 0 && i < S.full.dates.length) setAsOf(S.full.dates[i]); }
 
-  function findDrifts(sigs) { // contiguous stretches where the gap was unusual enough to trade
-    const c = S.cfg.signal, out = [];
-    let ep = null;
-    sigs.forEach((s, k) => {
-      if (bad(s.z)) return;
-      if (!ep) {
-        if (s.eligible && Math.abs(s.z) >= c.entry_z) ep = { k0: k, k1: k, start: s.date, end: null, side: Math.sign(s.z), peak: s.z, status: "open" };
-        return;
+  // ------------------------------------------------------------ model: σ bands from the 90 trading days before today
+  function buildModel(a, b, ha, hb, session, lastA, lastB) {
+    const series = { [a]: {}, [b]: {} };
+    for (const d of Object.keys(ha)) if (d < session && hb[d] != null) { series[a][d] = ha[d]; series[b][d] = hb[d]; }
+    series[a][session] = lastA; series[b][session] = lastB;
+    const md = E.fromSeries(series, { rate: S.cfg.data.risk_free_rate });
+    const t = md.dates.length - 1;
+    const sig = E.computeSignal(E.logs(md.closes[a]), E.logs(md.closes[b]), t, S.cfg.signal, md.dates[t]);
+    if (bad(sig.z)) throw new DataError(sig.reasons[0] || "Not enough history for this pair.");
+    const mean = sig.spread - sig.z * sig.resid_std;
+    return { md, sig, alpha: sig.alpha, beta: sig.beta, mean, sd: sig.resid_std, prevA: md.closes[a][t - 1], prevB: md.closes[b][t - 1] };
+  }
+  const zOf = (pa, pb) => (Math.log(pa) - S.model.alpha - S.model.beta * Math.log(pb) - S.model.mean) / S.model.sd;
+
+  async function loadPair(a, b, { silent = false } = {}) {
+    const id = ++S.loadId;
+    S.pair = [a, b]; savePrefs();
+    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.trade = null; S.prec = null; S.model = null; paint(true); }
+    try {
+      const [ha, hb] = [await daily(a), await daily(b)];
+      const [ia, ib] = [await tdBars(a, "1min", 390), await tdBars(b, "1min", 390)];
+      if (id !== S.loadId) return;
+      const session = [ia[ia.length - 1][0], ib[ib.length - 1][0]].sort().pop().slice(0, 10);
+      const mapB = new Map(ib.filter(r => r[0].startsWith(session)).map(r => [r[0].slice(11, 16), r[1]]));
+      const pts = [];
+      for (const [dt, pa] of ia) {
+        if (!dt.startsWith(session)) continue;
+        const pb = mapB.get(dt.slice(11, 16));
+        if (pb == null) continue;
+        const [h, m] = dt.slice(11, 16).split(":").map(Number);
+        pts.push({ m: h * 60 + m, a: pa, b: pb });
       }
-      ep.k1 = k;
-      if (Math.sign(s.z) === ep.side && Math.abs(s.z) > Math.abs(ep.peak)) ep.peak = s.z;
-      if (ep.side * s.z <= c.exit_z) { ep.end = s.date; ep.status = "closed"; out.push(ep); ep = null; }
-      else if (Math.abs(s.z) >= c.stop_z) { ep.end = s.date; ep.status = "broke"; out.push(ep); ep = null; }
-    });
-    if (ep) out.push(ep);
-    return out.reverse();
-  }
-  function analyze() {
-    const md = S.md, n = md.dates.length, la = E.logs(md.closes[S.pair[0]]), lb = E.logs(md.closes[S.pair[1]]);
-    const days = PERIODS.find(p => p[0] === S.period)[1];
-    const start = Math.max(S.cfg.signal.lookback, n - days);
-    const sigs = [];
-    for (let t = start; t < n; t++) sigs.push(E.computeSignal(la, lb, t, S.cfg.signal, md.dates[t]));
-    const prec = E.precedent(md, S.pair, S.cfg); // past drifts on this pair shape the expiry, as in the cloud watcher
-    S.an = { start, sigs, drifts: findDrifts(sigs), prec, scan: E.paperScan(S.ledger, md, S.pair, E.precedentConfig(S.cfg, prec)), record: undefined, outcomes: {} };
-  }
-  function record() { // the rules' walk-forward record on this pair (after costs), computed once per analysis
-    if (S.an.record !== undefined) return S.an.record;
-    try { S.an.record = E.walkForward(S.md, S.pair, S.cfg); } catch { S.an.record = null; }
-    return S.an.record;
-  }
-  function outcome(ep) { // what the rules would have done with this drift
-    if (S.an.outcomes[ep.start]) return S.an.outcomes[ep.start];
-    const i = S.md.dates.indexOf(ep.start), sim = new E.Simulator(S.md, S.pair, S.cfg);
-    sim.run(i, Math.min(S.md.dates.length, i + 70), S.cfg.signal.entry_z);
-    const tr = sim.trades[0];
-    let o;
-    if (tr) o = { pnl: tr.pnl, cost: tr.entry_cost, days: tr.days_held, reason: tr.exit_reason, legs: tr.legs };
-    else if (sim.position) o = { open: true, pnl: sim.position.mark - sim.position.entryCost, cost: sim.position.entryCost, legs: sim.position.proposal.legs.map(l => `${l.contracts}x ${E.qKey(l.quote)}`).join(", ") };
-    else o = { skipped: sim.rejections[0] ? sim.rejections[0].reasons[0] : "No trade" };
-    return (S.an.outcomes[ep.start] = o);
+      if (!pts.length) throw new DataError("No trades today yet for this pair.");
+      const lastPt = pts[pts.length - 1];
+      S.model = buildModel(a, b, ha, hb, session, lastPt.a, lastPt.b);
+      S.session = session; S.pts = pts; S.hist = { [a]: ha, [b]: hb };
+      S.last = { [a]: { p: lastPt.a, t: 0 }, [b]: { p: lastPt.b, t: 0 } };
+      S.status = "ready";
+      Live.watch([a, b]);
+      updateTrade(true);
+    } catch (e) {
+      if (id !== S.loadId) return;
+      if (silent && S.status === "ready") return; // keep showing the last good data
+      S.status = "error"; S.error = { msg: e.message, kind: e.kind };
+    }
+    paint(!silent);
   }
 
-  // ------------------------------------------------------------ actions
-  function useDemo() {
-    S.source = "demo"; S.pair = ["SYNA", "SYNB"]; S.error = null;
-    S.full = E.makeSynthetic({ rate: S.cfg.data.risk_free_rate });
-    setAsOf(latest());
+  function onTrade(sym, price, t) {
+    if (S.status !== "ready" || !S.last[sym] || !(price > 0)) return;
+    const ny = nyParts(t);
+    if (ny.min < OPEN || ny.min > CLOSE) return; // pre-market and after-hours trades don't move the regular-session chart
+    if (ny.day !== S.session) { if (ny.day > S.session) loadPair(...S.pair); return; }
+    S.last[sym] = { p: price, t };
+    S.lastTick = Date.now(); S.dirty = true;
   }
-  async function loadPair(a, b, refresh = false) {
-    a = a.trim().toUpperCase(); b = b.trim().toUpperCase();
-    if (!/^[A-Z.\-]{1,10}$/.test(a) || !/^[A-Z.\-]{1,10}$/.test(b) || a === b) { S.error = { msg: "Enter two different tickers, like KO and PEP." }; render(); return; }
-    S.pick = [a, b]; S.busy = "load"; S.error = null; savePrefs(); render();
+  setInterval(() => { // fold the latest trades into the chart every 2 seconds
+    if (!S.dirty || S.status !== "ready") return;
+    S.dirty = false;
+    const [a, b] = S.pair, ny = nyParts(Date.now());
+    const pt = { m: Math.min(ny.min, CLOSE), a: S.last[a].p, b: S.last[b].p };
+    const prev = S.pts[S.pts.length - 1];
+    if (prev && pt.m - prev.m < 5 / 60) S.pts[S.pts.length - 1] = pt; else S.pts.push(pt);
+    if (S.pts.length > 4000) S.pts = S.pts.filter((_, i) => i % 2 === 0);
+    updateTrade(false);
+    paint();
+  }, 2000);
+  setInterval(() => { if (S.status === "ready") paint(); }, 15000); // keep "updated Xs ago" honest when quiet
+
+  // ------------------------------------------------------------ suggested trade when the drift passes the signal level
+  function updateTrade(force) {
+    if (!force && Date.now() - S.tradeAt < 30000) return;
+    S.tradeAt = Date.now();
+    const [a, b] = S.pair, z = zOf(S.last[a].p, S.last[b].p);
+    if (Math.abs(z) < S.cfg.signal.entry_z || !S.model.sig.eligible) { S.trade = null; return; }
+    const md = buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md, t = md.dates.length - 1;
+    const sig = E.computeSignal(E.logs(md.closes[a]), E.logs(md.closes[b]), t, S.cfg.signal, md.dates[t]);
+    if (!S.prec) S.prec = E.precedent(md, S.pair, S.cfg);
+    const eq = S.cfg.risk.starting_equity;
+    S.trade = E.propose(md, S.pair, sig, t, { equity: eq, peak_equity: eq, open_trades: 0, premium_at_risk: 0 }, E.precedentConfig(S.cfg, S.prec));
+  }
+
+  // ------------------------------------------------------------ watcher status line (ntfy), once a minute
+  async function fetchWatch() {
+    const topic = local.get("ntfytopic");
+    if (!topic || inClaude) return;
     try {
-      const ca = await getSeries(a, refresh), cb = await getSeries(b, refresh);
-      S.full = buildReal(a, b, ca, cb); S.source = "real"; S.pair = [a, b]; S.open = null;
-      setAsOf(latest()); savePrefs();
-    } catch (e) {
-      S.error = { msg: e.message, kind: e.kind };
-    } finally { S.busy = null; render(); }
+      const r = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}-status/json?poll=1&since=latest`);
+      const msgs = (await r.text()).trim().split("\n").filter(Boolean).map(l => JSON.parse(l)).filter(m => m.event === "message");
+      if (msgs.length) { S.watch = JSON.parse(msgs[msgs.length - 1].message); paint(true); }
+    } catch { /* status line just stays as it was */ }
   }
-  function trackTrade() {
-    const r = S.an.scan.result;
-    try {
-      const rec = E.paperConfirm(S.ledger, r.id, S.md, S.cfg);
-      saveLedger(); analyze(); S.sheet = null; S.view = "positions";
-      toast(`Tracking ${S.pair.join(" / ")} · ${money(rec.max_loss)} committed`);
-    } catch (e) { S.sheet = null; toast(e.message); }
-  }
-  function closeTrade(id) {
-    try {
-      const c = E.paperClose(S.ledger, id, S.md, S.cfg);
-      saveLedger(); analyze(); S.sheet = null;
-      toast(`Closed · ${money(c.pnl, true)}`);
-    } catch (e) { S.sheet = null; toast(e.message); }
-  }
-  let toastTimer;
-  function toast(msg) { S.toast = msg; render(); clearTimeout(toastTimer); toastTimer = setTimeout(() => { S.toast = null; render(); }, 3500); }
 
   // ------------------------------------------------------------ charts
-  function chart({ lines, labels, shades = [], refs = [], h = 220, fmt = v => v.toFixed(0), sel = null }) {
-    const W = 720, H = h, pl = 6, pr = 52, pt = 10, pb = 24, n = labels.length;
-    const all = lines.flatMap(l => l.vals.filter(v => !bad(v))).concat(refs.map(r => r[0]));
-    if (!all.length) return "";
-    let lo = Math.min(...all), hi = Math.max(...all);
-    if (hi === lo) { hi += 1; lo -= 1; }
-    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
-    const X = i => pl + (W - pl - pr) * i / Math.max(n - 1, 1), Y = v => pt + (H - pt - pb) * (1 - (v - lo) / (hi - lo));
-    let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img">`;
-    for (const [k0, k1, key] of shades) s += `<rect class="shade${key === sel ? " sel" : ""}" x="${X(k0).toFixed(1)}" y="${pt}" width="${Math.max(X(k1) - X(k0), 3).toFixed(1)}" height="${H - pt - pb}" rx="3"/>`;
-    for (const [v, cls] of refs) s += `<line class="${cls}" x1="${pl}" x2="${W - pr}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>`;
-    for (const l of lines) {
-      let d = "", pen = false;
-      l.vals.forEach((v, i) => { if (bad(v)) { pen = false; return; } d += `${pen ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`; pen = true; });
-      s += `<path class="${l.cls}" d="${d}"/>`;
-      const li = l.vals.length - 1;
-      if (!bad(l.vals[li])) s += `<circle class="dot" cx="${X(li).toFixed(1)}" cy="${Y(l.vals[li]).toFixed(1)}" r="4"/><text x="${W - pr + 8}" y="${(Y(l.vals[li]) + 4).toFixed(1)}">${esc(l.tag || "")}</text>`;
-    }
-    for (const [v] of refs.filter(r => r[2])) s += `<text x="${W - pr + 8}" y="${(Y(v) + 4).toFixed(1)}">${esc(fmt(v))}</text>`;
-    s += `<text x="${pl}" y="${H - 4}">${esc(dMon(labels[0]))}</text><text x="${W - pr}" y="${H - 4}" text-anchor="end">${esc(dMon(labels[n - 1]))}</text>`;
-    return s + "</svg>";
+  const W = 720;
+  function axis(h, pb) {
+    const X = m => 8 + (W - 64) * (Math.min(Math.max(m, OPEN), CLOSE) - OPEN) / (CLOSE - OPEN);
+    let s = "";
+    for (const [m, l] of [[OPEN, "9:30"], [720, "12:00"], [CLOSE, "4:00 ET"]]) s += `<text x="${X(m).toFixed(1)}" y="${h - 4}" text-anchor="${m === OPEN ? "start" : m === CLOSE ? "end" : "middle"}">${l}</text>`;
+    return { X, s };
   }
-  function spark(vals, up) {
-    const W = 300, H = 56, n = vals.length;
-    if (n < 2) return "";
-    let lo = Math.min(...vals), hi = Math.max(...vals); if (hi === lo) { hi += 1; lo -= 1; }
-    const X = i => W * i / (n - 1), Y = v => 4 + (H - 8) * (1 - (v - lo) / (hi - lo));
-    const d = vals.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
-    const col = up ? "var(--up)" : "var(--down)";
-    return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="a" d="${d}L${W},${H}L0,${H}Z" fill="${col}"/><path class="l" d="${d}" stroke="${col}"/></svg>`;
+  function pathOf(pts, X, Y, f) { return pts.map((p, i) => `${i ? "L" : "M"}${X(p.m).toFixed(1)},${Y(f(p)).toFixed(1)}`).join(""); }
+
+  function priceChart() {
+    const [a, b] = S.pair, H = 230, pt = 12, pb = 22, M = S.model;
+    const ca = p => p.a / M.prevA - 1, cb = p => p.b / M.prevB - 1;
+    const vals = S.pts.flatMap(p => [ca(p), cb(p)]);
+    let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals); const pad = Math.max((hi - lo) * 0.12, 0.002); lo -= pad; hi += pad;
+    const { X, s: ax } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v - lo) / (hi - lo));
+    const last = S.pts[S.pts.length - 1];
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(a)} and ${esc(b)} change today">
+      <line class="zero" x1="8" x2="${W - 56}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}"/>
+      <path class="ln-b" d="${pathOf(S.pts, X, Y, cb)}"/><path class="ln-a" d="${pathOf(S.pts, X, Y, ca)}"/>
+      <circle class="dot live" cx="${X(last.m).toFixed(1)}" cy="${Y(ca(last)).toFixed(1)}" r="4.5"/>
+      <circle class="dot b" cx="${X(last.m).toFixed(1)}" cy="${Y(cb(last)).toFixed(1)}" r="4"/>
+      <text x="${W - 50}" y="${(Y(ca(last)) + 4).toFixed(1)}" class="tag-a">${esc(a)}</text>
+      <text x="${W - 50}" y="${(Y(cb(last)) + 4 + (Math.abs(Y(ca(last)) - Y(cb(last))) < 14 ? 13 : 0)).toFixed(1)}">${esc(b)}</text>
+      ${ax}</svg>`;
   }
 
-  // ------------------------------------------------------------ views
-  const legName = l => `Buy ${l.contracts} ${l.symbol} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}`;
-  const tag = r => `<span class="tag ${r === "C" ? "call" : "put"}">${r === "C" ? "CALL" : "PUT"}</span>`;
-
-  function viewPicker() {
-    const isPreset = p => S.source === "real" && S.pair[0] === p[0] && S.pair[1] === p[1];
-    return `<section class="card">
-      <div class="chips" role="group" aria-label="Pair">
-        ${PRESETS.map(p => `<button class="chip" data-act="preset" data-a="${p[0]}" data-b="${p[1]}" aria-pressed="${isPreset(p)}">${p[0]} · ${p[1]}</button>`).join("")}
-        <button class="chip" data-act="demo" aria-pressed="${S.source === "demo"}">Demo</button>
-      </div>
-      <div class="pickers">
-        <input class="input" id="tk-a" value="${esc(S.pick[0])}" aria-label="First ticker" autocomplete="off" spellcheck="false">
-        <span>/</span>
-        <input class="input" id="tk-b" value="${esc(S.pick[1])}" aria-label="Second ticker" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="head" style="align-items:center">
-        <div class="seg" role="group" aria-label="Period">${PERIODS.map(([p]) => `<button data-act="period" data-p="${p}" aria-pressed="${S.period === p}">${p}</button>`).join("")}</div>
-        <button class="btn primary" data-act="analyze">${S.busy === "load" ? '<span class="spin"></span>' : ""}Analyze</button>
-      </div>
-      ${S.error ? `<div class="note warn">${esc(S.error.msg)}</div>
-        ${S.error.kind === "key" && !inClaude ? `<div class="field"><input class="input plain" id="td-key" type="password" placeholder="Twelve Data API key" autocomplete="off">
-          <small>Free at twelvedata.com. Stored only in this browser.</small><div><button class="btn sm primary" data-act="save-key">Save key</button></div></div>` : ""}` : ""}
-    </section>`;
+  function driftChart() {
+    const H = 230, pt = 10, pb = 22, zs = S.pts.map(p => zOf(p.a, p.b));
+    const lim = Math.max(2.6, ...zs.map(z => Math.abs(z) + 0.3));
+    const { X, s: ax } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v + lim) / (2 * lim));
+    const band = (y0, y1, cls) => `<rect class="${cls}" x="8" width="${W - 64}" y="${Y(y1).toFixed(1)}" height="${(Y(y0) - Y(y1)).toFixed(1)}"/>`;
+    const last = S.pts[S.pts.length - 1], zl = zs[zs.length - 1];
+    let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Drift in standard deviations">`;
+    s += band(2, lim, "zone-out") + band(-lim, -2, "zone-out") + band(1, 2, "zone-2") + band(-2, -1, "zone-2") + band(-1, 1, "zone-1");
+    for (const v of [2, 1, 0, -1, -2]) s += `<line class="${v ? "band-l" : "zero"}" x1="8" x2="${W - 56}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/><text x="${W - 50}" y="${(Y(v) + 4).toFixed(1)}">${v ? (v > 0 ? "+" : "−") + Math.abs(v) + "σ" : "0"}</text>`;
+    s += `<path class="ln-z" d="${pathOf(S.pts.map((p, i) => ({ m: p.m, z: zs[i] })), X, Y, p => p.z)}"/>`;
+    s += `<circle class="dot live" cx="${X(last.m).toFixed(1)}" cy="${Y(zl).toFixed(1)}" r="5"/>`;
+    return s + ax + "</svg>";
   }
 
-  function viewAnalyze() {
-    const an = S.an, sigs = an.sigs, cur = sigs[sigs.length - 1], [a, b] = S.pair, c = S.cfg.signal;
-    const live = an.drifts.find(e => e.status === "open");
-    const pill = bad(cur.z) ? `<span class="pill">No signal</span>`
-      : live ? `<span class="pill drift">Drifting · ${esc(cur.z > 0 ? a : b)} rich</span>`
-      : !cur.eligible && Math.abs(cur.z) >= c.entry_z ? `<span class="pill down">Unstable pair</span>`
-      : `<span class="pill">Near parity</span>`;
-    const md = S.md, labels = md.dates.slice(an.start);
-    const pa = Array.from(md.closes[a].slice(an.start)), pb = Array.from(md.closes[b].slice(an.start));
-    const base = (arr) => { const f = arr.find(v => !bad(v)); return arr.map(v => bad(v) ? NaN : v / f * 100); };
-    const shades = an.drifts.map(e => [e.k0, e.k1, e.start]);
-    const ch = S.chart === "prices"
-      ? chart({ lines: [{ vals: base(pb), cls: "ln-b", tag: b }, { vals: base(pa), cls: "ln-a", tag: a }], labels, shades, sel: S.open })
-      : chart({ lines: [{ vals: sigs.map(s => s.z), cls: "ln-z", tag: zf(cur.z) }], labels, shades, sel: S.open, h: 200, fmt: zf,
-          refs: [[c.entry_z, "band", 1], [-c.entry_z, "band", 1], [0, "zero"]] });
-    const dataLine = S.source === "demo" ? "Demo data (made up)" : `Twelve Data · daily close ${dShort(latest())}`;
+  // ------------------------------------------------------------ view
+  function liveBadge() {
+    const ny = nyParts(Date.now()), open = ny.day === S.session && ny.min >= OPEN && ny.min <= CLOSE && new Date().getUTCDay() % 6 !== 0;
+    if (inClaude) return `<span class="pill">Refreshes every minute</span>`;
+    if (!local.get("fhkey")) return `<button class="pill warn-pill" data-act="sheet" data-s="settings">Live off · add Finnhub key</button>`;
+    if (!open) return `<span class="pill">Market closed · ${esc(dDay(S.session))}</span>`;
+    if (Live.state === "open") return `<span class="pill up pulse">Live${S.lastTick ? ` · ${esc(ago(S.lastTick))}` : ""}</span>`;
+    return `<span class="pill drift">${Live.state === "connecting" ? "Connecting…" : "Reconnecting…"}</span>`;
+  }
 
+  function viewPair() {
+    if (S.status === "loading") return `<section class="card empty"><span class="spin big-spin"></span><p class="note">Loading ${esc(S.pair.join(" / "))}…</p></section>`;
+    if (S.status === "error") return `<section class="card empty"><h3 class="mid">Couldn't load ${esc(S.pair.join(" / "))}</h3><p class="note">${esc(S.error.msg)}</p>
+      <div class="row-btns">${S.error.kind === "key" ? `<button class="btn primary" data-act="sheet" data-s="settings">Open settings</button>` : ""}<button class="btn" data-act="retry">Try again</button></div></section>`;
+    if (S.status !== "ready") return "";
+    const [a, b] = S.pair, M = S.model, la = S.last[a].p, lb = S.last[b].p, z = zOf(la, lb), az = Math.abs(z), entry = S.cfg.signal.entry_z;
+    const band = az < 1 ? ["Within 1σ", ""] : az < 2 ? ["Within 2σ", "drift"] : ["Beyond 2σ", "down"];
+    const rich = z > 0 ? a : b;
+    const unstable = !M.sig.eligible;
+    const chg = (p, prev) => p / prev - 1;
     return `
-      ${replaying() ? `<div class="replay"><span class="grow">Replay · ${dLong(S.asOf)}</span>
-        <button data-act="day" data-k="-1" aria-label="Previous day">‹</button><button data-act="day" data-k="1" aria-label="Next day">›</button><button data-act="today">Today</button></div>` : ""}
-      ${viewPicker()}
       <section class="card">
-        <div class="head"><div><div class="pair-name">${esc(a)} / ${esc(b)}</div><div class="small muted">${esc(dataLine)}${S.source === "real" ? ` · <button class="link" data-act="refresh">Refresh</button>` : ""}</div></div>${pill}</div>
-        <div class="stats">
-          <div class="stat"><span class="label">Drift now</span><span class="big ${live ? "drift" : ""}">${zf(cur.z)}</span></div>
-          <div class="stat"><span class="label">Trade signal at</span><span class="v">±${c.entry_z.toFixed(1)}</span></div>
-          <div class="stat"><span class="label">Drifts in ${esc(S.period)}</span><span class="v">${an.drifts.length}</span></div>
-        </div>
-        <div class="seg" role="group" aria-label="Chart">
-          <button data-act="chart" data-c="prices" aria-pressed="${S.chart === "prices"}">Prices</button>
-          <button data-act="chart" data-c="drift" aria-pressed="${S.chart === "drift"}">Drift</button>
-        </div>
-        ${ch}
-        <div class="legend">${S.chart === "prices" ? `<span><i style="background:var(--line-a)"></i>${esc(a)}</span><span><i style="background:var(--line-b)"></i>${esc(b)}</span>` : `<span><i style="background:var(--drift)"></i>Signal ±${c.entry_z}</span>`}
-          <span><i style="background:var(--drift-soft);height:10px"></i>Drift periods</span></div>
+        <div class="head"><div class="quotes">
+            <div><span class="sym"><i class="sw a"></i>${esc(a)}</span><span class="px">${cents(la)}</span><span class="${chg(la, M.prevA) >= 0 ? "up" : "down"} small">${pct(chg(la, M.prevA))}</span></div>
+            <div><span class="sym"><i class="sw b"></i>${esc(b)}</span><span class="px">${cents(lb)}</span><span class="${chg(lb, M.prevB) >= 0 ? "up" : "down"} small">${pct(chg(lb, M.prevB))}</span></div>
+          </div>${liveBadge()}</div>
+        ${priceChart()}
       </section>
-      ${viewTrade()}
-      ${viewDrifts()}
-      ${viewRecord()}
-      <p class="foot">Paper trading only · not financial advice · option prices are modeled</p>`;
+      <section class="card">
+        <div class="head"><div><span class="label">Drift between them</span><div class="big ${band[1]}">${zf(z)}σ</div>
+          <div class="small muted">${az < 0.5 ? "Moving in step" : `${esc(rich)} is ${az < 1 ? "slightly" : az < 2 ? "noticeably" : "unusually"} rich vs ${esc(rich === a ? b : a)}`}</div></div>
+          <span class="pill ${band[1]}">${band[0]}</span></div>
+        ${driftChart()}
+        <div class="legend"><span><i class="zk z1"></i>Within 1σ (normal)</span><span><i class="zk z2"></i>1–2σ</span><span><i class="zk zo"></i>Beyond ${entry}σ: trade signal</span></div>
+        ${unstable ? `<p class="note warn">This pair isn't moving together reliably right now (${esc(M.sig.reasons[0])}), so drift here isn't a signal.</p>` : ""}
+      </section>
+      ${viewTrade(z)}`;
   }
 
-  function viewTrade() {
-    const r = S.an.scan.result, c = S.cfg.signal;
-    if (r.type !== "proposal") {
-      const open = r.stage === "risk" && /already have a paper trade/.test(r.reasons[0]);
-      const z = S.an.scan.signal.z;
-      const msg = open ? "You're already tracking this pair."
-        : r.stage === "signal" && !bad(z) && Math.abs(z) < c.entry_z ? `Drift is ${zf(z)}. A trade triggers at ±${c.entry_z.toFixed(1)}.`
-        : r.reasons[0];
-      return `<section class="card"><div class="head"><h3 class="mid">No trade now</h3>
-        ${open ? `<button class="btn sm" data-act="view" data-v="positions">View position</button>` : ""}</div>
-        <p class="note">${esc(msg)}</p></section>`;
-    }
-    const conv = r.scenarios.find(s => s.name.startsWith("The gap closes completely") || s.name.startsWith("Spread fully"));
-    const flat = r.scenarios.find(s => s.name.startsWith("Nothing moves"));
-    const exp = r.legs[0].quote.expiry;
-    return `<section class="card">
-      <div class="head"><h3 class="mid">Suggested trade</h3><span class="small muted">${dLong(r.quote_date)}</span></div>
-      ${r.legs.map(l => `<div class="leg">${tag(l.right)}<div><div class="t">${legName(l)}</div><div class="s">$${l.quote.strike} strike · expires ${dShort(l.quote.expiry)} · ${cents(l.entry_price)} each</div></div>
+  function viewTrade(z) {
+    const entry = S.cfg.signal.entry_z;
+    if (Math.abs(z) < entry || !S.trade) return `<section class="card quiet"><p class="note">A trade is suggested when the drift passes ±${entry}σ. Now ${zf(z)}σ${S.model.sig.eligible ? "" : ", and the pair is unstable"}.</p></section>`;
+    const r = S.trade;
+    if (r.type !== "proposal") return `<section class="card"><h3 class="mid">Beyond ${entry}σ, no trade fits</h3><p class="note">${esc(r.reasons[0])}</p></section>`;
+    const p = S.prec, conv = r.scenarios.find(s => s.name.startsWith("The gap closes completely"));
+    return `<section class="card signal">
+      <div class="head"><h3 class="mid">Suggested trade</h3><span class="pill down">Signal</span></div>
+      ${r.legs.map(l => `<div class="leg"><span class="tag ${l.right === "C" ? "call" : "put"}">${l.right === "C" ? "CALL" : "PUT"}</span>
+        <div><div class="t">Buy ${l.contracts} ${esc(l.symbol)} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}</div><div class="s">$${l.quote.strike} strike · expires ${dShort(l.quote.expiry)}</div></div>
         <div class="r">${money(l.entry_price * 100 * l.contracts)}</div></div>`).join("")}
-      <div class="divider"></div>
       <div class="stats">
         <div class="stat"><span class="label">Max loss</span><span class="v">${money(r.max_loss)}</span></div>
-        <div class="stat"><span class="label">If gap closes · 2 wks</span><span class="v ${conv.pnl >= 0 ? "up" : "down"}">${money(conv.pnl, true)}</span></div>
-        <div class="stat"><span class="label">If nothing moves</span><span class="v ${flat.pnl >= 0 ? "up" : "down"}">${money(flat.pnl, true)}</span></div>
+        <div class="stat"><span class="label">If the gap closes · 2 wks</span><span class="v ${conv.pnl >= 0 ? "up" : "down"}">${money(conv.pnl, true)}</span></div>
       </div>
-      ${precLine()}
       ${conv.pnl < 0 ? `<p class="note warn">Time decay and costs outweigh the expected gain. Consider skipping.</p>` : ""}
-      <p class="note">Closes when drift returns inside ±${c.exit_z}, after ${c.max_hold_days} trading days, or a week before ${dShort(exp)}.</p>
-      <button class="btn primary block" data-act="ask-track">Track this trade</button>
+      ${p && p.n ? `<p class="note${p.thin ? " warn" : ""}">Precedent: ${p.closed} of ${p.n} past drifts closed${p.median_days != null ? `, typically in ${plural(Math.round(p.median_days), "trading day")}` : ""}.</p>` : ""}
+      <p class="note">Option prices are modeled. Check live quotes before trading. Not financial advice.</p>
     </section>`;
   }
 
-  function precLine() {
-    const p = S.an.prec;
-    if (!p.n) return `<p class="note">No earlier drifts on this pair to learn from.</p>`;
-    const days = p.median_days == null ? "" : `, typically in ${plural(Math.round(p.median_days), "trading day")}`;
-    const won = p.trades.length ? ` Rules' trades won ${p.wins} of ${p.trades.length}.` : "";
-    return `<p class="note${p.thin ? " warn" : ""}"><b>Precedent:</b> ${p.closed} of ${p.n} past drifts closed${days}.${won}${p.thin ? " Few cases, so treat with caution." : ""}</p>`;
+  function watchLine() {
+    const w = S.watch;
+    if (inClaude) return `Live streaming runs at <a href="${PAGES_URL}" target="_blank" rel="noopener">${esc(PAGES_URL.replace("https://", "").replace(/\/$/, ""))}</a>`;
+    if (!w) return local.get("ntfytopic") ? "Watcher: no status yet" : "Phone alerts: add your alert topic in settings to see the watcher here";
+    const last = new Date(w.last || w.at).getTime(), stale = w.open && Date.now() - last > 25 * 60000;
+    return `Watcher ${w.open ? (stale ? "delayed" : "live") : "idle (market closed)"} · last check ${esc(ago(last))} · ${plural((w.alerts || []).length, "alert")} sent recently`;
   }
 
-  function viewDrifts() {
-    const ds = S.an.drifts, [a, b] = S.pair;
-    if (!ds.length) return `<section class="card"><h3 class="mid">Drift periods</h3><p class="note">No significant drift in this period.</p></section>`;
-    const rows = ds.map(e => {
-      const rich = e.side > 0 ? a : b, days = e.k1 - e.k0, isOpen = S.open === e.start;
-      const when = e.end ? `${dShort(e.start)} – ${dShort(e.end)}` : `Since ${dShort(e.start)}`;
-      const status = e.status === "open" ? "Ongoing" : e.status === "broke" ? "Broke apart" : `Closed in ${plural(days, "day")}`;
-      let detail = "";
-      if (isOpen) {
-        const o = outcome(e);
-        detail = `<div class="detail">${o.skipped ? `<p class="note">Rules skipped it: ${esc(o.skipped)}</p>` : `
-          <p class="small muted">${esc(o.legs)}</p>
-          <div class="stats"><div class="stat"><span class="label">Rules' result</span><span class="v ${o.pnl >= 0 ? "up" : "down"}">${money(o.pnl, true)}</span></div>
-          <div class="stat"><span class="label">Paid</span><span class="v">${money(o.cost)}</span></div>
-          <div class="stat"><span class="label">${o.open ? "Status" : "Held"}</span><span class="v">${o.open ? "Open" : plural(o.days, "day")}</span></div></div>`}
-          ${e.start < S.asOf ? `<div><button class="btn sm" data-act="replay" data-d="${e.start}">Replay from ${dShort(e.start)}</button></div>` : ""}</div>`;
-      }
-      return `<button class="item" data-act="drift" data-d="${e.start}" aria-expanded="${isOpen}">
-          <span><span class="t">${when}</span><span class="s">${esc(rich)} rich · peak ${zf(e.peak)} · ${status}</span></span><span class="r faint">${isOpen ? "–" : "+"}</span>
-        </button>${detail}`;
-    }).join("");
-    return `<section class="card"><h3 class="mid">Drift periods</h3><div class="list">${rows}</div></section>`;
-  }
-
-  function viewRecord() {
-    if (!S.recordShown) return `<section class="card"><div class="head" style="align-items:center"><div><h3 class="mid">Rules' track record</h3>
-      <p class="note">How these rules did on this pair in past years, after costs.</p></div><button class="btn sm" data-act="record">Run test</button></div></section>`;
-    const bt = record();
-    if (!bt) return `<section class="card"><h3 class="mid">Rules' track record</h3><p class="note">Not enough history for a fair test.</p></section>`;
-    const m = bt.metrics, ci = m.mean_trade_ci90, luck = !ci || (ci[0] <= 0 && 0 <= ci[1]);
-    return `<section class="card"><h3 class="mid">Rules' track record</h3>
-      <div class="stats">
-        <div class="stat"><span class="label">Return after costs</span><span class="v ${m.total_return >= 0 ? "up" : "down"}">${pct(m.total_return, 1, true)}</span></div>
-        <div class="stat"><span class="label">Trades · won</span><span class="v">${m.trades} · ${pct(m.win_rate, 0)}</span></div>
-        <div class="stat"><span class="label">Worst drop</span><span class="v down">${pct(-m.max_drawdown, 1)}</span></div>
-      </div>
-      <p class="note ${luck ? "warn" : ""}">${luck ? "Too few or too mixed results to rule out luck." : "Tested only on unseen periods. Past results don't predict future ones."}</p></section>`;
-  }
-
-  function posHistory(rec) { // value of the position for each day from entry to the as-of date
-    const ds = S.md.dates.filter(d => d >= rec.quote_date), vals = [];
-    for (const d of ds) {
-      const qs = rec.legs.map(l => S.md.options.quote(l.symbol, d, l.expiry, l.strike, l.right));
-      if (qs.every(Boolean)) vals.push(qs.reduce((s, q, k) => s + (q.bid || 0) * 100 * rec.legs[k].contracts, 0));
-    }
-    return vals;
-  }
-
-  function viewPositions() {
-    const st = E.ledgerState(S.ledger, S.md, S.cfg), marks = E.ledgerMarks(S.ledger, S.md, S.cfg);
-    const gain = st.equity - S.ledger.starting_equity;
-    const cards = marks.map(mk => {
-      const r = mk.record, [a, b] = r.pair;
-      if (mk.blocked) return `<section class="card"><div class="pair-name">${esc(a)} / ${esc(b)}</div><p class="note">${esc(mk.blocked)}</p>
-        ${S.source === "real" || a === "SYNA" ? "" : `<button class="btn sm" data-act="preset" data-a="${a}" data-b="${b}">Load ${esc(a)} / ${esc(b)}</button>`}</section>`;
-      const pnl = mk.unrealized, closeNow = mk.exits.length > 0;
-      const zNow = mk.z, prog = bad(zNow) ? 0 : Math.max(0, Math.min(1, 1 - Math.abs(zNow) / Math.abs(r.signal_z)));
-      const hist = posHistory(r);
-      return `<section class="card">
-        <div class="head"><div><div class="pair-name">${esc(a)} / ${esc(b)}</div><div class="small muted">Opened ${dShort(r.quote_date)} · day ${mk.held} of ${S.cfg.signal.max_hold_days}</div></div>
-          ${closeNow ? `<span class="pill up">Close now</span>` : `<span class="pill">Hold</span>`}</div>
-        <div><div class="big ${pnl >= 0 ? "up" : "down"}">${money(pnl, true)}</div><div class="small muted">${pct(pnl / r.max_loss, 1, true)} · paid ${money(r.max_loss)} · worth ${money(mk.value)}</div></div>
-        ${spark(hist, pnl >= 0)}
-        <div class="field"><div class="head small"><span class="label">Gap closed</span><span class="num">${pct(prog, 0)} · drift ${zf(zNow)} → target ±${S.cfg.signal.exit_z}</span></div><div class="prog"><i style="width:${(prog * 100).toFixed(0)}%"></i></div></div>
-        ${r.legs.map(l => `<div class="leg">${tag(l.right)}<div><div class="t">${legName(l)}</div><div class="s">$${l.strike} strike · expires ${dShort(l.expiry)}</div></div><div class="r">${cents(l.entry_price)}</div></div>`).join("")}
-        ${closeNow ? `<p class="note">${esc(mk.exits.map(x => x.replace(/\s*\(z [^)]*\)/, "").replace(/:.*$/, "")).join(" · "))}</p>` : ""}
-        <button class="btn ${closeNow ? "primary" : ""} block" data-act="ask-close" data-id="${esc(r.id)}">Close position</button>
-      </section>`;
-    }).join("");
-    const closed = [...S.ledger.closed].reverse().slice(0, 12);
-    return `
-      ${replaying() ? `<div class="replay"><span class="grow">Replay · ${dLong(S.asOf)}</span>
-        <button data-act="day" data-k="-1" aria-label="Previous day">‹</button><button data-act="day" data-k="1" aria-label="Next day">›</button>
-        ${marks.length ? `<button data-act="skip">Skip to close signal</button>` : `<button data-act="today">Today</button>`}</div>` : ""}
-      <section class="card"><span class="label">Paper account</span><div class="big">${money(st.equity)}</div>
-        <div class="small ${gain >= 0 ? "up" : "down"}">${money(gain, true)} all time <span class="muted">· ${money(st.premium_at_risk)} at risk</span></div></section>
-      ${cards || `<section class="card empty"><h3 class="mid">Nothing tracked yet</h3><p class="note">Analyze a pair and track a suggested trade.</p>
-        <button class="btn primary" data-act="view" data-v="analyze">Analyze a pair</button></section>`}
-      ${closed.length ? `<section class="card"><h3 class="mid">Closed</h3><div class="list">${closed.map(c => `<div class="item" style="cursor:default">
-        <div><div class="t">${esc(c.pair.join(" / "))}</div><div class="s">${dShort(c.quote_date)} – ${dShort(c.closed_quote_date)} · paid ${money(c.max_loss)}</div></div>
-        <div class="r ${c.pnl >= 0 ? "up" : "down"}">${money(c.pnl, true)}</div></div>`).join("")}</div></section>` : ""}
-      <p class="foot">Paper trading only · positions valued at the bid${S.source === "real" ? ` · <button class="link" data-act="refresh">Refresh prices</button>` : ""}</p>`;
-  }
-
-  // ------------------------------------------------------------ watcher screen
-  function miniZ(series, entry) { // today's drift path for one pair, with the alert lines
-    const W = 320, H = 90, pt = 6, pb = 16, n = series.length;
-    if (n < 2) return `<p class="note">Today's drift path appears after a few checks.</p>`;
-    const vals = series.map(s => s[1]), lim = Math.max(entry + 0.5, ...vals.map(Math.abs));
-    const X = i => W * i / (n - 1), Y = v => pt + (H - pt - pb) * (1 - (v + lim) / (2 * lim));
-    const d = vals.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
-    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Drift today">
-      <line class="band" x1="0" x2="${W}" y1="${Y(entry)}" y2="${Y(entry)}"/><line class="band" x1="0" x2="${W}" y1="${Y(-entry)}" y2="${Y(-entry)}"/>
-      <line class="zero" x1="0" x2="${W}" y1="${Y(0)}" y2="${Y(0)}"/><path class="ln-z" d="${d}"/>
-      <circle class="dot" cx="${X(n - 1)}" cy="${Y(vals[n - 1])}" r="4"/>
-      <text x="0" y="${H - 2}">${esc(series[0][0])}</text><text x="${W}" y="${H - 2}" text-anchor="end">${esc(series[n - 1][0])} ET</text></svg>`;
-  }
-  function runsTimeline(runs, alerts) { // each check as a dot across the 9:30-16:00 session
-    const W = 640, H = 34, toMin = t => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
-    const x = t => 8 + (W - 16) * Math.min(1, Math.max(0, (toMin(t) - 570) / 390));
-    const alertTimes = new Set(alerts.map(a => new Date(a.t).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: "America/New_York" })));
-    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Checks today">
-      <line class="zero" x1="8" x2="${W - 8}" y1="12" y2="12"/>
-      ${runs.map(t => `<circle cx="${x(t).toFixed(1)}" cy="12" r="${alertTimes.has(t) ? 6 : 3.5}" fill="${alertTimes.has(t) ? "var(--drift)" : "var(--line-a)"}"/>`).join("")}
-      <text x="8" y="32">9:30</text><text x="${W / 2}" y="32" text-anchor="middle">12:45</text><text x="${W - 8}" y="32" text-anchor="end">16:00 ET</text></svg>`;
-  }
-  function viewWatcher() {
-    if (inClaude) return `<section class="card empty"><h3 class="mid">Watcher</h3>
-      <p class="note">claude.ai doesn't let pages read outside services, so the live watcher view runs at your Pairs Lab web address.</p>
-      <a class="btn primary" href="${PAGES_URL}" target="_blank" rel="noopener">Open ${esc(PAGES_URL.replace("https://", ""))}</a></section>`;
-    if (!local.get("ntfytopic")) return `<section class="card"><h3 class="mid">Connect the watcher</h3>
-      <p class="note">Paste your alert topic (the pairslab-… name you subscribed to in ntfy). It stays in this browser.</p>
-      <input class="input plain" id="ntfy-topic" placeholder="pairslab-…" autocomplete="off" spellcheck="false">
-      <button class="btn primary" data-act="save-topic">Connect</button></section>`;
-    const w = S.watch, st = w.status;
-    if (!st) return `<section class="card empty"><h3 class="mid">Watcher</h3><p class="note">${esc(w.error || "Loading status…")}</p>
-      <button class="btn" data-act="watch-refresh">${w.loading ? '<span class="spin"></span>' : ""}Refresh</button></section>`;
-    const last = st.last || st.at, minsSince = (Date.now() - new Date(last).getTime()) / 60000;
-    const state = !st.open ? ["Market closed", ""] : minsSince > 25 ? ["Delayed", "drift"] : ["Live", "up"];
-    const next = st.open ? new Date(new Date(last).getTime() + st.every * 60000) : null;
-    const pairs = st.pairs.map(p => {
-      const tracking = st.tracking && st.tracking[p.p];
-      const pill = p.n === "ALERT" || tracking ? `<span class="pill drift">Drifting</span>` : p.n.includes("unstable") ? `<span class="pill down">Unstable</span>` : `<span class="pill">Near parity</span>`;
-      const [a, b] = p.p.split("/");
-      return `<section class="card">
-        <div class="head"><div class="pair-name">${esc(p.p.replace("/", " / "))}</div>${pill}</div>
-        <div class="stats"><div class="stat"><span class="label">Drift now</span><span class="big ${tracking ? "drift" : ""}">${zf(p.z)}</span></div>
-          <div class="stat"><span class="label">Alert at</span><span class="v">±${st.entry}</span></div></div>
-        ${miniZ(p.s || [], st.entry)}
-        <button class="btn sm" data-act="preset" data-a="${esc(a)}" data-b="${esc(b)}">Analyze ${esc(p.p.replace("/", " / "))}</button></section>`;
-    }).join("");
-    return `
-      <section class="card">
-        <div class="head"><div><span class="label">Cloud watcher</span><div class="big">${state[0]}</div></div><span class="pill ${state[1]}">${state[0] === "Live" ? "Checking every 10 min" : state[0]}</span></div>
-        <div class="stats">
-          <div class="stat"><span class="label">Last check</span><span class="v">${esc(ago(last))}</span></div>
-          <div class="stat"><span class="label">Next check</span><span class="v">${next ? esc(next > new Date() ? `~${Math.max(1, Math.round((next - Date.now()) / 60000))} min` : "any moment") : "At the open"}</span></div>
-          <div class="stat"><span class="label">Checks today</span><span class="v">${st.runs.length}</span></div>
-        </div>
-        ${st.runs.length ? runsTimeline(st.runs, st.alerts) : ""}
-        <p class="note">Status from ${esc(ago(st.at))} · refreshes every minute · <button class="link" data-act="watch-refresh">Refresh now</button></p>
-      </section>
-      ${pairs || `<section class="card"><p class="note">No pairs checked yet.</p></section>`}
-      <section class="card"><h3 class="mid">Alerts sent</h3>
-        ${st.alerts.length ? `<div class="list">${st.alerts.map(al => `<div class="item" style="cursor:default">
-          <span><span class="t">${esc(al.title)}</span><span class="s" style="white-space:pre-line">${esc(al.msg)}</span></span>
-          <span class="r faint small">${esc(ago(al.t))}</span></div>`).join("")}</div>` : `<p class="note">None yet. You'll get a phone alert when a pair drifts past ±${st.entry}.</p>`}
-      </section>
-      <p class="foot">Runs on GitHub every 10 minutes while the market is open · alerts via ntfy · decision support only</p>`;
-  }
-
-  // ------------------------------------------------------------ sheets
   function sheetView() {
-    if (!S.sheet) return "";
-    let body = "";
-    if (S.sheet === "track") {
-      const r = S.an.scan.result;
-      body = `<h2>Track this trade?</h2>
-        ${r.legs.map(l => `<div class="leg">${tag(l.right)}<div><div class="t">${legName(l)}</div><div class="s">$${l.quote.strike} strike · ${dShort(l.quote.expiry)}</div></div><div class="r">${money(l.entry_price * 100 * l.contracts)}</div></div>`).join("")}
-        <div class="divider"></div>
-        <div class="head"><span class="muted">Paper money committed</span><span class="mid">${money(r.max_loss)}</span></div>
-        <p class="note">Simulated at the asking price. That's also the most this trade can lose.</p>
-        <button class="btn primary block" data-act="track">Confirm</button><button class="btn block" data-act="sheet-close">Cancel</button>`;
-    } else if (S.sheet.startsWith("close:")) {
-      const id = S.sheet.slice(6), rec = S.ledger.positions.find(p => p.id === id);
-      let est = null;
-      if (rec) {
-        const qs = rec.legs.map(l => S.md.options.quote(l.symbol, S.asOf, l.expiry, l.strike, l.right));
-        if (qs.every(Boolean)) est = qs.reduce((s, q, k) => s + (E.sellPrice(q, S.cfg.costs) || 0) * 100 * rec.legs[k].contracts, 0) - E.fees(rec.legs.reduce((s, l) => s + l.contracts, 0), S.cfg.costs);
-      }
-      body = `<h2>Close ${esc(rec ? rec.pair.join(" / ") : "")}?</h2>
-        <div class="stats"><div class="stat"><span class="label">You receive</span><span class="v">${money(est)}</span></div>
-        <div class="stat"><span class="label">Result</span><span class="v ${est - (rec ? rec.max_loss : 0) >= 0 ? "up" : "down"}">${est == null ? "–" : money(est - rec.max_loss, true)}</span></div></div>
-        <p class="note">Sells both options at the bid, after fees.</p>
-        <button class="btn primary block" data-act="close" data-id="${esc(id)}">Close position</button><button class="btn block" data-act="sheet-close">Keep open</button>`;
-    } else if (S.sheet === "settings") {
-      const f = (sec, key, label, scale, step) => `<div class="field"><label class="label" for="s-${key}">${label}</label>
-        <input class="input plain" id="s-${key}" type="number" step="${step}" data-sec="${sec}" data-key="${key}" data-scale="${scale}" value="${+(S.cfg[sec][key] * scale).toFixed(4)}"></div>`;
-      body = `<h2>Settings</h2>
-        ${f("risk", "starting_equity", "Paper account size ($)", 1, 1000)}
-        ${f("risk", "max_loss_per_trade_pct", "Max loss per trade (% of account)", 100, 0.5)}
-        ${f("signal", "entry_z", "Trade when drift reaches", 1, 0.1)}
-        ${f("signal", "exit_z", "Close when drift is back within", 1, 0.1)}
-        ${f("signal", "max_hold_days", "Max days in a trade", 1, 1)}
-        ${inClaude ? `<p class="note">Real prices come from your Twelve Data connector.</p>` : `<div class="field"><label class="label" for="td-key">Twelve Data key</label>
-          <input class="input plain" id="td-key" type="password" placeholder="${local.get("tdkey") ? "Saved · paste to replace" : "Paste your free key"}" autocomplete="off"></div>
-          <div class="field"><label class="label" for="ntfy-topic-set">Watcher alert topic</label>
-          <input class="input plain" id="ntfy-topic-set" type="password" placeholder="${local.get("ntfytopic") ? "Saved · paste to replace" : "pairslab-…"}" autocomplete="off"></div>`}
-        <button class="btn primary block" data-act="save-settings">Save</button>
-        <div class="row-btns"><button class="btn sm" data-act="defaults">Restore defaults</button><button class="btn sm" data-act="reset">Reset paper account</button></div>`;
-    } else if (S.sheet === "info") {
-      body = `<h2>How it works</h2><ul>
-        <li>Two companies that usually move together, like Coke and Pepsi, sometimes drift apart.</li>
-        <li><b>Drift</b> measures how unusual the gap is. ±1 is normal; at ±${S.cfg.signal.entry_z} the app suggests a trade.</li>
-        <li>The trade buys <b>puts</b> on the expensive stock and <b>calls</b> on the cheap one. It profits if the gap closes; the most you can lose is what you paid.</li>
-        <li>Positions tells you to hold or close, based on fixed rules.</li>
-        <li>Paper money only. Stock prices are real (Twelve Data); option prices are modeled. Not financial advice.</li></ul>
-        <button class="btn primary block" data-act="sheet-close">Got it</button>`;
-    } else if (S.sheet === "reset") {
-      body = `<h2>Reset paper account?</h2><p class="note">Erases all tracked and closed trades and restarts with ${money(S.cfg.risk.starting_equity)}.</p>
-        <button class="btn primary block" data-act="reset-yes">Reset</button><button class="btn block" data-act="sheet-close">Cancel</button>`;
+    if (S.sheet === "settings") {
+      const f = (id, label, val, help, type = "password") => `<div class="field"><label class="label" for="${id}">${label}</label>
+        <input class="input plain" id="${id}" type="${type}" placeholder="${val}" autocomplete="off" spellcheck="false">${help ? `<small>${help}</small>` : ""}</div>`;
+      const n = (sec, k, label, scale, step) => `<div class="field"><label class="label" for="n-${k}">${label}</label>
+        <input class="input plain" id="n-${k}" type="number" step="${step}" data-sec="${sec}" data-key="${k}" data-scale="${scale}" value="${+(S.cfg[sec][k] * scale).toFixed(4)}"></div>`;
+      return sheet(`<h2>Settings</h2>
+        ${inClaude ? `<p class="note">Prices come from your Twelve Data connector. Live streaming runs at your web address.</p>` : `
+        ${f("k-td", "Twelve Data key (history)", local.get("tdkey") ? "Saved · paste to replace" : "Required", "Free at twelvedata.com → Account → API keys.")}
+        ${f("k-fh", "Finnhub key (live trades)", local.get("fhkey") ? "Saved · paste to replace" : "For live updates", "Free at finnhub.io → Dashboard → API key.")}
+        ${f("k-nt", "Alert topic (watcher status)", local.get("ntfytopic") ? "Saved · paste to replace" : "pairslab-…", "")}`}
+        ${n("signal", "entry_z", "Trade signal at (σ)", 1, 0.1)}
+        ${n("risk", "starting_equity", "Account size for sizing ($)", 1, 1000)}
+        ${n("risk", "max_loss_per_trade_pct", "Max loss per trade (%)", 100, 0.5)}
+        <p class="note">Keys stay in this browser and go only to Twelve Data, Finnhub and ntfy.</p>
+        <button class="btn primary block" data-act="save-settings">Save</button>`);
     }
-    return `<div class="scrim" data-act="scrim"><div class="sheet" role="dialog" aria-modal="true">${body}</div></div>`;
+    if (S.sheet === "add") return sheet(`<h2>Add a pair</h2><p class="note">Two companies in the same business tend to work best.</p>
+      <div class="pickers"><input class="input" id="add-a" placeholder="KO" aria-label="First ticker"><span>/</span><input class="input" id="add-b" placeholder="PEP" aria-label="Second ticker"></div>
+      <button class="btn primary block" data-act="add-pair">Track this pair</button>`);
+    return "";
+  }
+  const sheet = body => `<div class="scrim" data-act="scrim"><div class="sheet" role="dialog" aria-modal="true">${body}<button class="btn block" data-act="sheet-close">Close</button></div></div>`;
+
+  function setupView() {
+    return `<section class="card"><h3 class="mid">Connect your data</h3>
+      <p class="note">Two free keys: Twelve Data for price history and the σ bands, Finnhub for live trades. They stay in this browser.</p>
+      <div class="field"><label class="label" for="k-td">Twelve Data key</label><input class="input plain" id="k-td" type="password" autocomplete="off"><small>twelvedata.com → Account → API keys</small></div>
+      <div class="field"><label class="label" for="k-fh">Finnhub key</label><input class="input plain" id="k-fh" type="password" autocomplete="off"><small>finnhub.io → Dashboard (optional; without it the chart doesn't move)</small></div>
+      <button class="btn primary block" data-act="save-settings">Start</button></section>`;
   }
 
-  // ------------------------------------------------------------ render
-  function render() {
-    const y = window.scrollY, focusId = document.activeElement && document.activeElement.id;
-    const n = S.ledger.positions.length;
-    app.innerHTML = `
-      <header class="top"><div class="top-in">
-        <span class="brand">Pairs Lab</span>
-        <div class="seg" role="group" aria-label="Screen">
-          <button data-act="view" data-v="analyze" aria-pressed="${S.view === "analyze"}">Analyze</button>
-          <button data-act="view" data-v="positions" aria-pressed="${S.view === "positions"}">Positions${n ? `<span class="badge">${n}</span>` : ""}</button>
-          <button data-act="view" data-v="watcher" aria-pressed="${S.view === "watcher"}">Watcher</button>
-        </div>
-        <button class="icon-btn" data-act="sheet" data-s="info" aria-label="How it works">${ICON.info}</button>
-        <button class="icon-btn" data-act="sheet" data-s="settings" aria-label="Settings">${ICON.gear}</button>
-      </div></header>
-      <main>${S.view === "analyze" ? viewAnalyze() : S.view === "positions" ? viewPositions() : viewWatcher()}</main>
-      ${sheetView()}
-      ${S.toast ? `<div class="toast" role="status">${esc(S.toast)}</div>` : ""}`;
-    window.scrollTo(0, y);
-    if (focusId) { const el = document.getElementById(focusId); if (el) el.focus({ preventScroll: true }); }
+  // ------------------------------------------------------------ render: the shell once, the live area on every update
+  function paint(full = false) {
+    if (full || !document.getElementById("live")) {
+      const list = pairList(), groups = [...new Set(list.map(x => x.group))];
+      app.innerHTML = `
+        <header class="top"><div class="top-in">
+          <span class="brand">Pairs Lab</span>
+          <div class="select-wrap"><select id="pair-select" aria-label="Pair">
+            ${groups.map(g => `<optgroup label="${esc(g)}">${list.filter(x => x.group === g).map(x => `<option value="${esc(key(x.p))}" ${key(x.p) === key(S.pair) ? "selected" : ""}>${esc(x.p.join(" / "))}</option>`).join("")}</optgroup>`).join("")}
+            <option value="__add">+ Add a pair…</option></select></div>
+          <button class="icon-btn" data-act="sheet" data-s="settings" aria-label="Settings">${ICON.gear}</button>
+        </div></header>
+        <main id="live"></main>
+        <p class="foot" id="watch-line"></p>
+        <div id="sheet-root"></div><div id="toast-root"></div>`;
+    }
+    const needKeys = !inClaude && !local.get("tdkey");
+    document.getElementById("live").innerHTML = needKeys ? setupView() : viewPair();
+    document.getElementById("watch-line").innerHTML = `${watchLine()}<br>Paper analysis only · option prices modeled · not financial advice`;
+    const sr = document.getElementById("sheet-root");
+    if (sr.dataset.sheet !== (S.sheet || "")) { sr.innerHTML = sheetView(); sr.dataset.sheet = S.sheet || ""; }
+    document.getElementById("toast-root").innerHTML = S.toast ? `<div class="toast" role="status">${esc(S.toast)}</div>` : "";
   }
+  let toastT;
+  function toast(m) { S.toast = m; paint(); clearTimeout(toastT); toastT = setTimeout(() => { S.toast = null; paint(); }, 3000); }
 
   // ------------------------------------------------------------ events
+  app.addEventListener("change", ev => {
+    if (ev.target.id !== "pair-select") return;
+    const v = ev.target.value;
+    if (v === "__add") { ev.target.value = key(S.pair); S.sheet = "add"; paint(); return; }
+    loadPair(...v.split("/"));
+  });
   app.addEventListener("click", ev => {
     const el = ev.target.closest("[data-act]");
-    if (!el || el.disabled) return;
+    if (!el) return;
     const act = el.dataset.act;
-    if (act === "scrim" && ev.target !== el) return; // clicks inside the sheet
-    switch (act) {
-      case "view":
-        S.view = el.dataset.v; window.scrollTo(0, 0);
-        if (S.view === "watcher" && !inClaude && Date.now() - S.watch.fetchedAt > 30000) { render(); fetchStatus(); return; }
-        break;
-      case "watch-refresh": fetchStatus(); return;
-      case "save-topic": {
-        const v = ((document.getElementById("ntfy-topic") || {}).value || "").trim();
-        if (!/^[\w-]{6,64}$/.test(v)) { toast("That doesn't look like a topic name"); return; }
-        local.set("ntfytopic", v.replace(/-status$/, "")); fetchStatus(); return;
+    if (act === "scrim" && ev.target !== el) return;
+    if (act === "sheet") { S.sheet = el.dataset.s; paint(); }
+    else if (act === "sheet-close" || act === "scrim") { S.sheet = null; paint(); }
+    else if (act === "retry") loadPair(...S.pair);
+    else if (act === "add-pair") {
+      const a = document.getElementById("add-a").value.trim().toUpperCase(), b = document.getElementById("add-b").value.trim().toUpperCase();
+      if (!/^[A-Z.\-]{1,10}$/.test(a) || !/^[A-Z.\-]{1,10}$/.test(b) || a === b) { toast("Enter two different tickers"); return; }
+      if (!S.custom.some(p => key(p) === key([a, b]))) S.custom.push([a, b]);
+      S.sheet = null; savePrefs(); loadPair(a, b);
+    } else if (act === "save-settings") {
+      const val = id => ((document.getElementById(id) || {}).value || "").trim();
+      const td = val("k-td"), fh = val("k-fh"), nt = val("k-nt");
+      if (td) local.set("tdkey", td);
+      const fhChanged = fh && fh !== local.get("fhkey");
+      if (fh) local.set("fhkey", fh);
+      if (/^[\w-]{6,64}$/.test(nt)) { local.set("ntfytopic", nt.replace(/-status$/, "")); fetchWatch(); }
+      for (const inp of app.querySelectorAll("input[data-key]")) {
+        const v = Number(inp.value);
+        if (Number.isFinite(v) && v > 0) S.cfg[inp.dataset.sec] = { ...S.cfg[inp.dataset.sec], [inp.dataset.key]: v / Number(inp.dataset.scale) };
       }
-      case "preset": S.pick = [el.dataset.a, el.dataset.b]; S.view = "analyze"; loadPair(el.dataset.a, el.dataset.b); return;
-      case "demo": useDemo(); savePrefs(); break;
-      case "analyze": loadPair(document.getElementById("tk-a").value, document.getElementById("tk-b").value); return;
-      case "refresh": loadPair(S.pair[0], S.pair[1], true); return;
-      case "period": S.period = el.dataset.p; savePrefs(); S.open = null; analyze(); break;
-      case "chart": S.chart = el.dataset.c; break;
-      case "drift": S.open = S.open === el.dataset.d ? null : el.dataset.d; break;
-      case "replay": S.open = null; setAsOf(el.dataset.d); window.scrollTo(0, 0); toast(`Replaying from ${dLong(S.asOf)}`); return;
-      case "day": stepDay(Number(el.dataset.k)); break;
-      case "today": setAsOf(latest()); break;
-      case "skip": {
-        for (let k = 0; k < 60 && replaying(); k++) {
-          if (E.ledgerMarks(S.ledger, S.md, S.cfg).some(m => m.exits.length)) break;
-          stepDay(1);
-        }
-        break;
-      }
-      case "record": S.recordShown = true; break;
-      case "ask-track": S.sheet = "track"; break;
-      case "track": trackTrade(); return;
-      case "ask-close": S.sheet = "close:" + el.dataset.id; break;
-      case "close": closeTrade(el.dataset.id); return;
-      case "sheet": S.sheet = el.dataset.s; break;
-      case "sheet-close": case "scrim": S.sheet = null; break;
-      case "save-key": {
-        const v = (document.getElementById("td-key") || {}).value || "";
-        if (!v.trim()) return;
-        local.set("tdkey", v.trim()); S.error = null; loadPair(S.pick[0], S.pick[1]); return;
-      }
-      case "save-settings": {
-        const cfg = JSON.parse(JSON.stringify(S.cfg));
-        for (const inp of app.querySelectorAll(".sheet input[data-key]")) {
-          const v = Number(inp.value);
-          if (Number.isFinite(v) && v > 0) cfg[inp.dataset.sec][inp.dataset.key] = v / Number(inp.dataset.scale);
-        }
-        const key = (document.getElementById("td-key") || {}).value || "";
-        if (key.trim()) local.set("tdkey", key.trim());
-        const topic = ((document.getElementById("ntfy-topic-set") || {}).value || "").trim();
-        if (/^[\w-]{6,64}$/.test(topic)) { local.set("ntfytopic", topic.replace(/-status$/, "")); S.watch.fetchedAt = 0; }
-        S.cfg = cfg; Store.save("settings", cfg); S.sheet = null; S.recordShown = false; analyze(); toast("Saved"); return;
-      }
-      case "defaults": S.cfg = E.defaultConfig(); Store.save("settings", S.cfg); S.sheet = null; analyze(); toast("Defaults restored"); return;
-      case "reset": S.sheet = "reset"; break;
-      case "reset-yes": S.ledger = E.newLedger(S.cfg); saveLedger(); analyze(); S.sheet = null; toast("Paper account reset"); return;
-      default: return;
+      local.set("risk", { signal: { entry_z: S.cfg.signal.entry_z }, risk: { starting_equity: S.cfg.risk.starting_equity, max_loss_per_trade_pct: S.cfg.risk.max_loss_per_trade_pct } });
+      S.sheet = null;
+      if (fhChanged) Live.reset();
+      loadPair(...S.pair);
     }
-    render();
   });
-  app.addEventListener("keydown", ev => {
-    if (ev.key === "Enter" && (ev.target.id === "tk-a" || ev.target.id === "tk-b")) loadPair(document.getElementById("tk-a").value, document.getElementById("tk-b").value);
-    if (ev.key === "Escape" && S.sheet) { S.sheet = null; render(); }
-  });
+  app.addEventListener("keydown", ev => { if (ev.key === "Escape" && S.sheet) { S.sheet = null; paint(); } });
 
-  // ------------------------------------------------------------ boot: cached real pair if there is one, else demo
-  function boot() {
-    const link = /^#([A-Za-z.]{1,10})-([A-Za-z.]{1,10})$/.exec(location.hash); // opened from a drift alert
-    if (link) { S.pick = [link[1].toUpperCase(), link[2].toUpperCase()]; prefs.source = "real"; }
-    const ca = prefs.source === "real" && local.get("td." + S.pick[0]), cb = prefs.source === "real" && local.get("td." + S.pick[1]);
-    if (link && !(ca && cb)) S.error = { msg: `Alert for ${S.pick[0]} / ${S.pick[1]}. Tap Analyze to load it.` };
-    if (ca && cb) {
-      try { S.full = buildReal(S.pick[0], S.pick[1], ca, cb); S.source = "real"; S.pair = [...S.pick]; setAsOf(latest()); return; } catch { /* fall back */ }
-    }
-    useDemo();
-  }
-  boot();
-  if (/^#watcher$/.test(location.hash)) S.view = "watcher";
-  render();
-  if (S.view === "watcher") fetchStatus();
-  setInterval(() => { if (S.view === "watcher" && !inClaude && !S.sheet && document.visibilityState === "visible") fetchStatus(); }, 60000);
-  (async () => {
-    await Store.init();
-    const [savedCfg, savedLedger] = await Promise.all([Store.load("settings"), Store.load("ledger")]);
-    if (savedCfg && savedCfg.signal && savedCfg.risk) {
-      const base = E.defaultConfig();
-      for (const k of Object.keys(base)) if (base[k] && typeof base[k] === "object" && !Array.isArray(base[k])) base[k] = { ...base[k], ...(savedCfg[k] || {}) };
-      S.cfg = base;
-    }
-    if (savedLedger && Array.isArray(savedLedger.positions)) S.ledger = { ...savedLedger, pending: {} };
-    analyze(); render();
-  })();
+  // ------------------------------------------------------------ boot
+  const link = /^#([A-Za-z.]{1,10})-([A-Za-z.]{1,10})$/.exec(location.hash); // opened from a phone alert
+  if (link) S.pair = [link[1].toUpperCase(), link[2].toUpperCase()];
+  paint(true);
+  if (inClaude || local.get("tdkey")) loadPair(...S.pair);
+  fetchWatch();
+  setInterval(fetchWatch, 60000);
+  if (inClaude) setInterval(() => { if (S.status === "ready" && document.visibilityState === "visible") loadPair(...S.pair, { silent: true }); }, 60000);
 })();
 </script>
 </body></html>
