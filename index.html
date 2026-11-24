@@ -214,6 +214,12 @@ main { max-width: 760px; margin: 0 auto; display: grid; gap: 14px; padding-block
 details > summary { cursor: pointer; font-weight: 700; padding: 4px 0; }
 details[open] > summary { margin-bottom: 6px; }
 @media (max-width: 520px) { .bar { grid-template-columns: minmax(0, 1fr) 70px; } .bar .track { grid-column: 1 / -1; grid-row: 2; } }
+
+/* ---------- expected sale ---------- */
+.sale { display: grid; gap: 4px; padding: 14px 16px; border-radius: 14px; background: var(--chip); }
+.sale .mid { font-size: 1.35rem; }
+.item a { color: inherit; text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 3px; }
+#model-card { scroll-margin-top: 76px; }
 </style>
 </head><body>
 <div id="app"><p style="padding:24px;font:16px system-ui">Loading Pairs Lab…</p></div>
@@ -1062,7 +1068,7 @@ const Engine = (() => {
     if (simulate) for (const d of drifts) {
       const sim = new Simulator(md, pair, cfg);
       sim.run(d.start_index, Math.min(md.dates.length, d.start_index + 70), cfg.signal.entry_z);
-      if (sim.trades.length) d.pnl = sim.trades[0].pnl;
+      if (sim.trades.length) { d.pnl = sim.trades[0].pnl; d.hold_days = sim.trades[0].days_held; }
     }
     const closeDays = drifts.filter(d => d.outcome === "closed").map(d => d.days);
     const trades = drifts.filter(d => d.pnl != null).map(d => d.pnl);
@@ -1071,6 +1077,7 @@ const Engine = (() => {
       close_days: closeDays, median_days: closeDays.length ? percentile(closeDays, 50) : null,
       p75_days: closeDays.length ? percentile(closeDays, 75) : null, trades, thin: drifts.length < 5,
       wins: trades.filter(p => p > 0).length, avg_pnl: trades.length ? mean(trades) : null,
+      median_hold: (h => h.length ? percentile(h, 50) : null)(drifts.filter(d => d.hold_days != null).map(d => d.hold_days)),
     };
   }
   function precedentConfig(cfg, prec) {
@@ -1078,6 +1085,79 @@ const Engine = (() => {
     const need = Math.ceil(prec.p75_days * 7 / 5) + cfg.options.exit_dte + 7;
     const min_dte = Math.max(cfg.options.min_dte, need), max_dte = Math.max(cfg.options.max_dte, min_dte + 35);
     return { ...cfg, options: { ...cfg.options, min_dte, max_dte } };
+  }
+
+  // ---------------------------------------------------------------- market factors (mirrors statarb/factors.py)
+  const EVENT_WORDS = ["merger", "acquire", "acquisition", "takeover", "buyout", "spin-off", "spinoff", "lawsuit", "sued", "settlement",
+    "investigation", "probe", "sec ", "fda", "recall", "downgrade", "upgrade", "guidance", "profit warning", "bankrupt",
+    "ceo", "resign", "layoff", "strike", "tariff", "sanction", "dividend cut", "buyback", "restructur", "activist"];
+  const nextWeekday = d => { do { d = addDays(d, 1); } while (weekday(d) >= 5); return d; };
+  function busdaysBetween(d0, d1) { let n = 0, d = d0; while (d < d1) { d = addDays(d, 1); if (weekday(d) < 5) n++; } return n; }
+  function addBusdays(d0, n) { let d = d0; for (let i = 0; i < n; i++) d = nextWeekday(d); return d; }
+  const reactionDate = (d, hour) => (hour || "").toLowerCase() === "amc" ? nextWeekday(d) : weekday(d) < 5 ? d : nextWeekday(d);
+
+  // earnings: {sym: [{date, hour}]}; news: {sym: [{datetime (epoch s), headline}]}; market: {date: close} (SPY).
+  function buildFactors(md, pair, t, cfg, earnings = null, news = null, market = null) {
+    const f = { events: [], break_boost: 0, stress: 1.0, notes: [], headlines: [], missing: [] };
+    const d0 = md.dates[t], H = cfg.signal.max_hold_days, idx = new Map(md.dates.map((d, i) => [d, i]));
+    if (!earnings) f.missing.push("earnings calendar");
+    else for (const sym of pair) {
+      const rows = [...(earnings[sym] || [])].sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0)), c = md.closes[sym];
+      const lr = diff(Array.from(c.slice(Math.max(0, t - 60), t + 1), Math.log));
+      const daily = lr.length > 2 ? std(lr.filter(v => !Number.isNaN(v))) : 0.015;
+      const past = [];
+      for (const r of rows) {
+        const rd = reactionDate(r.date, r.hour), i = idx.get(rd);
+        if (rd <= d0 && i != null && i >= 1 && !Number.isNaN(c[i]) && !Number.isNaN(c[i - 1])) past.push(Math.log(c[i] / c[i - 1]));
+      }
+      let sigma = past.length >= 4 ? Math.sqrt(past.reduce((a, v) => a + v * v, 0) / past.length) : 3 * daily;
+      const basis = past.length >= 4 ? `${past.length} past earnings reactions` : "3x daily volatility (few past earnings on record)";
+      sigma = Math.min(0.15, Math.max(0.01, sigma));
+      for (const r of rows) {
+        const rd = reactionDate(r.date, r.hour), k = busdaysBetween(d0, rd);
+        if (rd > d0 && k >= 1 && k <= H) {
+          f.events.push({ symbol: sym, date: rd, day: k, sigma, basis });
+          f.notes.push(`${sym} reports earnings ${rd} (day ${k} of the trade window); typical move ±${(sigma * 100).toFixed(1)}%`);
+          break;
+        }
+      }
+    }
+    f.events.sort((x, y) => (x.day - y.day) || (x.symbol < y.symbol ? -1 : 1));
+    if (!news) f.missing.push("company news");
+    else {
+      const end = Date.UTC(+d0.slice(0, 4), +d0.slice(5, 7) - 1, +d0.slice(8, 10), 23, 59, 59, 999) / 1000;
+      const rs = end - 3 * 86400, bs = end - 33 * 86400, intense = [];
+      let flagged = false;
+      for (const sym of pair) {
+        const items = (news[sym] || []).filter(n => n.headline);
+        const recent = items.filter(n => rs < n.datetime && n.datetime <= end), base = items.filter(n => bs < n.datetime && n.datetime <= rs);
+        if ((recent.length / 3) / Math.max(base.length / 30, 0.2) >= 3 && recent.length >= 3) intense.push(sym);
+        for (const n of [...recent].sort((x, y) => y.datetime - x.datetime)) {
+          const low = " " + n.headline.toLowerCase() + " ", w = EVENT_WORDS.find(x => low.includes(x));
+          const flag = w ? w.trim() : "";
+          flagged = flagged || !!flag;
+          f.headlines.push({ symbol: sym, date: new Date(n.datetime * 1000).toISOString().slice(0, 10), headline: n.headline, flag, url: n.url || "" });
+        }
+      }
+      f.headlines.sort((x, y) => ((x.flag === "") - (y.flag === "")) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
+      f.headlines = f.headlines.slice(0, 6);
+      f.break_boost = Math.min(0.15, (flagged ? 0.10 : 0) + (intense.length ? 0.05 : 0));
+      if (flagged) f.notes.push("Recent headlines mention events that can permanently move one stock; the drift may have a real cause");
+      if (intense.length) f.notes.push(`Unusually heavy news on ${intense.join(", ")} in the last 3 days`);
+    }
+    if (!market || !Object.keys(market).length) f.missing.push("S&P 500 prices");
+    else {
+      const closes = Object.keys(market).filter(d => d <= d0).sort().map(d => market[d]);
+      if (closes.length > 60) {
+        const r = diff(closes.slice(-273).map(Math.log)), vols = [];
+        for (let i = 20; i <= r.length; i++) vols.push(std(r.slice(i - 20, i)));
+        const now = vols[vols.length - 1], ref = percentile(vols, 50);
+        f.stress = ref > 0 ? Math.min(2.0, Math.max(0.6, now / ref)) : 1.0;
+        f.notes.push(`Market ${f.stress >= 1.3 ? "stressed" : f.stress <= 0.8 ? "calm" : "normal"}: S&P 500 volatility is ${(now / ref).toFixed(1)}x its usual level`);
+      } else f.missing.push("S&P 500 prices");
+    }
+    f.model = { events: f.events.map(e => [e.symbol, e.day, e.sigma]), break_boost: f.break_boost, stress: f.stress };
+    return f;
   }
 
   // ---------------------------------------------------------------- Monte Carlo options model (mirrors statarb/montecarlo.py)
@@ -1091,13 +1171,19 @@ const Engine = (() => {
     ["Market drop", 0.04, { vol: 1.5, eps: 1.3, iv: 1.5, jump: -0.08 }],
     ["Market rally", 0.04, { vol: 1.3, eps: 1.2, iv: 1.2, jump: 0.06 }],
   ];
-  function mcRegimes(prec) {
-    const bw = prec && prec.n >= 3 ? Math.min(0.30, Math.max(0.05, prec.broke / prec.n)) : 0.10;
-    return MC_REGIMES.map(([name, w, prm]) => [name, prm.brk ? bw : w * (1 - bw) / (1 - 0.10), prm]);
+  const STRESS_UP = ["High volatility", "Market drop", "Market rally"];
+  function mcRegimes(prec, factors = null) { // the pair's break rate, news (break_boost) and market stress shift the weights
+    let bw = prec && prec.n >= 3 ? Math.min(0.30, Math.max(0.05, prec.broke / prec.n)) : 0.10;
+    const stress = (factors && factors.stress) ?? 1.0;
+    bw = Math.min(0.45, bw + ((factors && factors.break_boost) ?? 0.0));
+    const adj = MC_REGIMES.filter(r => !r[2].brk).map(([name, w]) => w * (STRESS_UP.includes(name) ? stress : name === "Calm market" ? 1 / stress : 1.0));
+    const tot = adj.reduce((a, v) => a + v, 0);
+    let k = 0;
+    return MC_REGIMES.map(([name, , prm]) => [name, prm.brk ? bw : adj[k++] * (1 - bw) / tot, prm]);
   }
   function median(sorted) { const n = sorted.length; return n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2; }
 
-  function monteCarloPlan(md, pair, cfg, t = null, nPaths = 4000, prec = null, equity = null) {
+  function monteCarloPlan(md, pair, cfg, t = null, nPaths = 4000, prec = null, equity = null, factors = null) {
     const [a, b] = pair;
     t = t == null ? md.dates.length - 1 : t;
     const d0 = md.dates[t], la = logs(md.closes[a]), lb = logs(md.closes[b]);
@@ -1122,18 +1208,20 @@ const Engine = (() => {
     const nb = eb.length;
 
     // Monte Carlo paths
-    const regimes = mcRegimes(prec);
+    const regimes = mcRegimes(prec, factors);
+    const events = ((factors && factors.events) || []).map(([sym, day, sg]) => ({ sym, day: Math.trunc(day), sg: +sg }))
+      .sort((x, y) => (x.day - y.day) || (x.sym < y.sym ? -1 : x.sym > y.sym ? 1 : 0));
     const counts = regimes.map(r => Math.floor(r[1] * nPaths));
     counts[0] += nPaths - counts.reduce((s, c) => s + c, 0);
     const H = cfg.signal.max_hold_days, W = H + 1;
     const rng = mulberry32(crc32(`${a}/${b}|${d0}`));
-    const SA = new Float64Array(nPaths * W), SB = new Float64Array(nPaths * W), tau = new Int32Array(nPaths), reg = new Int32Array(nPaths);
+    const SA = new Float64Array(nPaths * W), SB = new Float64Array(nPaths * W), tau = new Int32Array(nPaths), reg = new Int32Array(nPaths), why = new Int32Array(nPaths);
     const s0 = sig.spread, x0 = lb[t], exitZ = cfg.signal.exit_z, stopZ = cfg.signal.stop_z;
     let p = 0;
     regimes.forEach(([, , prm], ri) => {
       const vol = prm.vol ?? 1.0, eps = prm.eps ?? 1.0, jump = prm.jump ?? 0.0, boot = !!prm.boot && nb > MC.block, brk = !!prm.brk;
       for (let n = 0; n < counts[ri]; n++) {
-        let s = s0, x = x0, j = 0, ex = 0;
+        let s = s0, x = x0, j = 0, ex = 0, wx = 0;
         SA[p * W] = Math.exp(sig.alpha + sig.beta * x + s); SB[p * W] = Math.exp(x);
         for (let d = 1; d <= H; d++) {
           if (boot) {
@@ -1145,11 +1233,16 @@ const Engine = (() => {
             x += vol * sigmaB * e1 + (d === 1 ? jump : 0.0);
             s = brk ? s + dsStd * 1.2 * e2 : m + phi * (s - m) + eps * sigEps * e2;
           }
+          for (const ev of events) { // earnings: an idiosyncratic jump in one stock moves the spread
+            if (ev.day !== d) continue;
+            const jmp = ev.sg * normal(rng);
+            if (ev.sym === b) { x += jmp; s -= sig.beta * jmp; } else s += jmp;
+          }
           SA[p * W + d] = Math.exp(sig.alpha + sig.beta * x + s); SB[p * W + d] = Math.exp(x);
           const z = (s - m) / sd;
-          if (ex === 0 && (side * z <= exitZ || Math.abs(z) >= stopZ)) ex = d;
+          if (ex === 0 && (side * z <= exitZ || Math.abs(z) >= stopZ)) { ex = d; wx = side * z <= exitZ ? 1 : 2; }
         }
-        tau[p] = ex || H; reg[p] = ri; p++;
+        tau[p] = ex || H; reg[p] = ri; why[p] = wx; p++;
       }
     });
     const ivm = Float64Array.from(reg, r => regimes[r][2].iv ?? 1.0);
@@ -1178,7 +1271,7 @@ const Engine = (() => {
             const v = bsPrice(S[i * W + te], k, trem, rate, q.iv * ivm[i], right);
             net[i] = Math.max(Math.max(v - exitCost, 0.0) * MULT - fee1, 0.0); // worthless: let it expire, no fee
           }
-          legsByExp[e][sym].push({ q, spot, buy, cost: buy * MULT + fee1, net, dd });
+          legsByExp[e][sym].push({ q, spot, buy, cost: buy * MULT + fee1, net, dd, cut });
           nLegs++;
         }
       }
@@ -1209,8 +1302,12 @@ const Engine = (() => {
       let v2 = 0; for (const v of pnl) v2 += (v - mu) * (v - mu);
       names.forEach((nm, ri) => { let s = 0, c = 0; for (let i = 0; i < nPaths; i++) if (reg[i] === ri) { s += pnl[i]; c++; } if (c) byRegime[nm] = s / c; });
       let c5 = 0; for (let i = 0; i < n5; i++) c5 += srt[i];
+      const te = [], cnt = [0, 0, 0, 0]; // sale day per path; why it sold: 0 time limit, 1 gap closed, 2 blew out, 3 expiry near
+      for (let i = 0; i < nPaths; i++) { te.push(Math.min(tau[i], r.A.cut)); cnt[r.A.cut < tau[i] ? 3 : why[i] === 1 ? 1 : why[i] === 2 ? 2 : 0]++; }
+      const exit = { p25: percentile(te, 25), p50: percentile(te, 50), p75: percentile(te, 75), p90: percentile(te, 90),
+                     closed: cnt[1] / nPaths, stopped: cnt[2] / nPaths, time: cnt[0] / nPaths, expiry: cnt[3] / nPaths, cut: r.A.cut };
       return { key: r.key, legs: [legDict(r.A, r.na), legDict(r.B, r.nb)], cost: r.cost, ev: r.ev, pop: r.pop, score: r.score, aligned: r.aligned,
-               sd: Math.sqrt(v2 / nPaths), median: median(srt), p5: srt[n5 - 1], cvar5: c5 / n5, by_regime: byRegime, scenarios: [], payoff_grid: [], greeks: {} };
+               sd: Math.sqrt(v2 / nPaths), median: median(srt), p5: srt[n5 - 1], cvar5: c5 / n5, by_regime: byRegime, scenarios: [], payoff_grid: [], greeks: {}, exit };
     };
     const top = entries.filter(r => r.aligned).slice(0, 5).map(full), overall = entries.slice(0, 5).map(full);
     if (top.length) mcDeterministic(top[0], md, pair, sig, t, cfg);
@@ -1220,7 +1317,7 @@ const Engine = (() => {
       calibration: { beta: sig.beta, beta_se: sig.beta_se, half_life: hl, phi, spread_sd: sd, daily_vol_b: sigmaB, correlation: sig.correlation, adf_t: sig.adf_t, history_days: nb },
       regimes: regimes.map(([name, weight], i) => ({ name, weight, paths: counts[i] })), paths: nPaths, horizon: H,
       converged_share: Array.from(tau).filter(v => v < H).length / nPaths, median_exit_day: median(exitDays),
-      legs: nLegs, combos: entries.length, top, overall, cloud: entries.map(r => [r.pop, r.score, r.aligned]), precedent: prec,
+      legs: nLegs, combos: entries.length, top, overall, cloud: entries.map(r => [r.pop, r.score, r.aligned]), precedent: prec, factors,
     };
   }
   function mcDeterministic(c, md, pair, sig, t, cfg) {
@@ -1337,7 +1434,7 @@ const Engine = (() => {
     makeSynthetic, fromSeries, loadCsv, exportCsv, parseCsv, truncated, assess, mdClose,
     computeSignal, signalSeries, ols, dickeyFuller, logs,
     slippage, buyPrice, sellPrice, fees, roundTripCost, checkLiquidity, checkParticipation, checkPortfolio, maxLossBudget,
-    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig, monteCarloPlan,
+    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig, monteCarloPlan, buildFactors, addBusdays,
     newLedger, ledgerMarks, ledgerState, paperScan, paperConfirm, paperClose, PaperError,
     qKey, qDte, qMid, qSpread, qSpreadPct, daysBetween, addDays, weekday,
     LIVE_TRADING_AVAILABLE, submitLiveOrder,
@@ -1550,7 +1647,7 @@ if (typeof module !== "undefined") module.exports = Engine;
   async function loadPair(a, b, { silent = false } = {}) {
     const id = ++S.loadId;
     S.pair = [a, b]; savePrefs();
-    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.mc = null; S.mcErr = null; S.prec = null; S.model = null; paint(true); }
+    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.mc = null; S.mcErr = null; S.prec = null; S.model = null; S.facIn = null; S.fac = null; paint(true); }
     try {
       const [ha, hb] = [await daily(a), await daily(b)];
       const [ia, ib] = [await tdBars(a, "1min", 390), await tdBars(b, "1min", 390)];
@@ -1572,7 +1669,8 @@ if (typeof module !== "undefined") module.exports = Engine;
       S.last = { [a]: { p: lastPt.a, t: 0 }, [b]: { p: lastPt.b, t: 0 } };
       S.status = "ready";
       Live.watch([a, b]);
-      updateTrade(true);
+      loadFactors(a, b, session, id);
+      if (S.fromAlert) runModel(); else updateTrade(true);
     } catch (e) {
       if (id !== S.loadId) return;
       if (silent && S.status === "ready") return; // keep showing the last good data
@@ -1602,6 +1700,35 @@ if (typeof module !== "undefined") module.exports = Engine;
   }, 2000);
   setInterval(() => { if (S.status === "ready") paint(); }, 15000); // keep "updated Xs ago" honest when quiet
 
+  // ------------------------------------------------------------ market factors: earnings, news, S&P 500
+  async function finnhub(path, params) {
+    const key = local.get("fhkey");
+    if (!key || inClaude) return null;
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/${path}?${new URLSearchParams({ ...params, token: key })}`);
+      if (!r.ok) return null; // e.g. not included in the plan
+      return await r.json();
+    } catch { return null; }
+  }
+  async function loadFactors(a, b, session, id) {
+    const from = E.addDays(session, -3 * 365), to = E.addDays(session, 60), nfrom = E.addDays(session, -33);
+    const earnings = {}, news = {};
+    let haveE = true, haveN = true;
+    for (const sym of [a, b]) {
+      const ec = await finnhub("calendar/earnings", { symbol: sym, from, to });
+      if (ec && Array.isArray(ec.earningsCalendar)) earnings[sym] = ec.earningsCalendar.filter(r => r.date).map(r => ({ date: r.date, hour: r.hour || "" }));
+      else haveE = false;
+      const nw = await finnhub("company-news", { symbol: sym, from: nfrom, to: session });
+      if (Array.isArray(nw)) news[sym] = nw.filter(n => n.datetime && n.headline).map(n => ({ datetime: n.datetime, headline: n.headline, url: n.url || "" }));
+      else haveN = false;
+    }
+    let market = null;
+    try { market = await daily("SPY"); } catch { market = null; }
+    if (id !== S.loadId) return;
+    S.facIn = { earnings: haveE ? earnings : null, news: haveN ? news : null, market, stamp: Date.now() };
+    if (S.mc && !S.mcBusy) runModel(); // fold the factors into the current analysis
+  }
+
   // ------------------------------------------------------------ options model: Monte Carlo over every call/put combination
   const isSignal = () => S.status === "ready" && S.model.sig.eligible && Math.abs(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) >= S.cfg.signal.entry_z;
   function updateTrade(force) { if (isSignal() && (force || !S.mc || Date.now() - S.mcAt > 60000)) runModel(); } // re-run at most once a minute
@@ -1614,10 +1741,14 @@ if (typeof module !== "undefined") module.exports = Engine;
         const [a, b] = S.pair;
         const md = buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md;
         if (!S.prec) S.prec = E.precedent(md, S.pair, S.cfg);
-        const plan = E.monteCarloPlan(md, S.pair, S.cfg, null, 4000, S.prec);
-        if (id === S.loadId) { S.mc = plan; S.mcAt = Date.now(); S.mcErr = null; }
+        const fi = S.facIn || {};
+        const fac = E.buildFactors(md, S.pair, md.dates.length - 1, S.cfg, fi.earnings || null, fi.news || null, fi.market || null);
+        const plan = E.monteCarloPlan(md, S.pair, S.cfg, null, 4000, S.prec, null, fac.model);
+        if (id === S.loadId) { S.mc = plan; S.fac = fac; S.mcAt = Date.now(); S.mcErr = null; S.mcFacStamp = S.facIn && S.facIn.stamp; }
       } catch (e) { if (id === S.loadId) S.mcErr = e.message; }
       S.mcBusy = false; paint();
+      if (S.fromAlert) { S.fromAlert = false; const el = document.getElementById("model-card"); if (el) el.scrollIntoView({ block: "start" }); }
+      if (id === S.loadId && S.mc && S.facIn && S.facIn.stamp !== S.mcFacStamp) runModel(); // factors arrived mid-run
     }, 40);
   }
 
@@ -1739,11 +1870,43 @@ if (typeof module !== "undefined") module.exports = Engine;
     return s + "</svg>";
   }
 
+  function saleView(c, plan) { // when to expect to sell, from the simulations, with the pair's history alongside
+    const e = c.exit, base = S.session, on = k => E.addBusdays(base, Math.max(1, Math.round(e[k])));
+    const prec = plan.precedent, dLong2 = d => new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    const why = [["closed", "the gap closes"], ["time", "the time limit"], ["expiry", "expiry nears"], ["stopped", "the gap blows out"]]
+      .filter(([k]) => e[k] >= 0.005).map(([k, t]) => `${t} ${pct(e[k], 0, false)}`).join(" · ");
+    return `<div class="sale"><div class="label">Expected sale</div>
+      <div class="mid">${esc(dLong2(on("p50")))}</div>
+      <div class="small muted">Likely between ${esc(dShort(on("p25")))} and ${esc(dShort(on("p75")))}${on("p90") > on("p75") ? ` · 9 in 10 by ${esc(dShort(on("p90")))}` : ""}</div>
+      <div class="small muted">What ends the trade in the simulations: ${why}</div>
+      ${prec && (prec.median_days != null || prec.median_hold != null) ? `<div class="small muted">History: ${prec.median_days != null ? `past drifts on this pair closed in ~${Math.round(prec.median_days)} trading days` : ""}${prec.median_days != null && prec.median_hold != null ? " · " : ""}${prec.median_hold != null ? `the rules held past trades ~${Math.round(prec.median_hold)} days` : ""}</div>` : ""}
+      <div class="small muted">The live page and phone alert tell you when the exit rules actually trigger.</div></div>`;
+  }
+
+  function factorsView(plan) {
+    const f = S.fac;
+    if (!f) return "";
+    const brk = (plan.regimes.find(r => r.name === "Relationship breaks") || {}).weight;
+    const rows = [];
+    for (const ev of f.events) rows.push(`<div class="item" style="cursor:default"><span><span class="t">${esc(labelOf(ev.symbol))} reports earnings ${esc(dShort(ev.date))}</span>
+      <span class="s">Day ${ev.day} of the trade · typical move ±${(ev.sigma * 100).toFixed(1)}% (${esc(ev.basis)}) · simulated as a jump</span></span><span class="r drift">Event</span></div>`);
+    for (const h of f.headlines.slice(0, 4)) rows.push(`<div class="item" style="cursor:default"><span><span class="t">${h.url ? `<a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.headline)}</a>` : esc(h.headline)}</span>
+      <span class="s">${esc(h.symbol)} · ${esc(dShort(h.date))}</span></span><span class="r ${h.flag ? "down" : "faint"}">${h.flag ? esc(h.flag) : "news"}</span></div>`);
+    const effect = [];
+    if (f.break_boost > 0) effect.push(`News raised the chance the pair breaks apart to ${pct(brk, 0, false)} of simulations`);
+    if (Math.abs(f.stress - 1) >= 0.05) effect.push(`Market stress ${f.stress > 1 ? "adds weight to volatile and shock" : "adds weight to calm"} markets (×${f.stress.toFixed(2)})`);
+    return `<div><div class="label">Market factors</div>
+      ${f.notes.filter(n => n.startsWith("Market ") || n.startsWith("Unusually")).map(n => `<p class="note">${esc(n)}</p>`).join("")}
+      ${rows.length ? `<div class="list">${rows.join("")}</div>` : f.missing.length ? "" : `<p class="note">No earnings in the trade window and no notable headlines.</p>`}
+      ${effect.length ? `<p class="note warn">${esc(effect.join(". "))}.</p>` : ""}
+      ${f.missing.length ? `<p class="note">Not checked: ${esc(f.missing.join(", "))}${inClaude ? " (available at your web address)" : !local.get("fhkey") ? " (add a Finnhub key in settings)" : ""}.</p>` : ""}</div>`;
+  }
+
   function viewModel(z) {
     const entry = S.cfg.signal.entry_z, signal = isSignal(), plan = S.mc;
     const head = `<div class="head"><div><h3 class="mid">Options model</h3><div class="small muted">Monte Carlo · every call/put combination</div></div>
       ${signal ? `<span class="pill down">Signal</span>` : `<span class="pill">No signal</span>`}</div>`;
-    if (!plan) return `<section class="card${S.mcBusy ? "" : " quiet"}">${head}
+    if (!plan) return `<section class="card${S.mcBusy ? "" : " quiet"}" id="model-card">${head}
       ${S.mcBusy ? `<p class="note"><span class="spin"></span>Simulating 4,000 markets and scoring every combination…</p>` : `
       <p class="note">${signal ? "Preparing…" : `Runs automatically when the drift passes ±${entry}σ (now ${zf(z)}σ${S.model.sig.eligible ? "" : ", and the pair is unstable"}).`}</p>
       ${S.mcErr ? `<p class="note warn">${esc(S.mcErr)}</p>` : ""}
@@ -1762,7 +1925,7 @@ if (typeof module !== "undefined") module.exports = Engine;
     }).join("");
     const det = c.scenarios.map(s => `<div class="item" style="cursor:default"><span><span class="t">${esc(s.name)}</span><span class="s">${esc(s.when)}</span></span>
       <span class="r ${s.pnl >= 0 ? "up" : "down"}">${money(s.pnl, true)}</span></div>`).join("");
-    return `<section class="card ${signal ? "signal" : ""}">${head}
+    return `<section class="card ${signal ? "signal" : ""}" id="model-card">${head}
       <p class="note">${summary}</p>
       <div class="label">Best pairs trade</div>
       ${c.legs.map(legLine).join("")}
@@ -1775,6 +1938,8 @@ if (typeof module !== "undefined") module.exports = Engine;
         <div class="stat"><span class="label">Worst 5% (avg)</span><span class="v down">${money(c.cvar5, true)}</span></div>
       </div>
       ${c.ev <= 0 ? `<p class="note warn">Even the best balanced combination loses money on average in these simulations. Consider skipping this one.</p>` : ""}
+      ${saleView(c, plan)}
+      ${factorsView(plan)}
       <div><div class="label">Outcome by market regime</div><div class="bars">${regimes}</div></div>
       <div><div class="label">All ${plan.combos.toLocaleString()} combinations</div>${cloudChart(plan)}
         <div class="legend"><span><i class="cdk best"></i>Suggested</span><span><i class="cdk pair"></i>Balanced pairs trades</span><span><i class="cdk"></i>Other combinations</span>${lead && !lead.aligned ? `<span><i class="cdk lead"></i>Top overall</span>` : ""}</div></div>
@@ -1903,7 +2068,7 @@ if (typeof module !== "undefined") module.exports = Engine;
 
   // ------------------------------------------------------------ boot
   const link = /^#([A-Za-z.]{1,10})-([A-Za-z.]{1,10})$/.exec(location.hash); // opened from a phone alert
-  if (link) S.pair = [link[1].toUpperCase(), link[2].toUpperCase()];
+  if (link) { S.pair = [link[1].toUpperCase(), link[2].toUpperCase()]; S.fromAlert = true; }
   paint(true);
   if (inClaude || local.get("tdkey")) loadPair(...S.pair);
   fetchWatch();
