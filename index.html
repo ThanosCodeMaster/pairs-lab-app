@@ -220,6 +220,8 @@ details[open] > summary { margin-bottom: 6px; }
 .sale .mid { font-size: 1.35rem; }
 .item a { color: inherit; text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 3px; }
 #model-card { scroll-margin-top: 76px; }
+.chart .ext { fill: var(--ink); opacity: .035; }
+.chart .ext-t { fill: var(--faint); font-size: 10px; }
 </style>
 </head><body>
 <div id="app"><p style="padding:24px;font:16px system-ui">Loading Pairs Lab…</p></div>
@@ -1467,7 +1469,14 @@ if (typeof module !== "undefined") module.exports = Engine;
     const p = Object.fromEntries(NYF.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
     return { day: `${p.year}-${p.month}-${p.day}`, min: +p.hour * 60 + +p.minute + +p.second / 60 };
   }
-  const OPEN = 570, CLOSE = 960; // 9:30 and 16:00 New York
+  const OPEN = 570, CLOSE = 960; // 9:30 and 16:00 New York (regular session)
+  const PRE = 240, POST = 1200;   // 4:00 and 20:00: pre-market and after-hours trading
+  const pad2 = n => String(Math.floor(n)).padStart(2, "0");
+  function phaseNow() { // closed | pre | open | post, New York time
+    const ny = nyParts(Date.now()), wd = (new Date(ny.day + "T00:00:00Z").getUTCDay() + 6) % 7;
+    const phase = wd >= 5 || ny.min < PRE || ny.min >= POST ? "closed" : ny.min < OPEN ? "pre" : ny.min <= CLOSE ? "open" : "post";
+    return { phase, ny, wd };
+  }
   const hm = m => `${Math.floor(m / 60)}:${String(Math.floor(m % 60)).padStart(2, "0")}`;
   const ago = ms => { const s = Math.round((Date.now() - ms) / 1000); return s < 5 ? "now" : s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
   const ICON = { gear: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>' };
@@ -1527,7 +1536,7 @@ if (typeof module !== "undefined") module.exports = Engine;
       const t = payload.trim();
       if (/^error\b/i.test(t)) {
         const msg = t.replace(/^error:?\s*/i, "").replace(/\*\*/g, "");
-        throw new DataError(/symbol|figi/i.test(msg) ? "Ticker not found. Use US symbols like KO or PEP." : /credit|limit/i.test(msg) ? "Twelve Data limit reached. Wait a minute." : msg, /symbol/i.test(msg) ? "symbol" : "other");
+        throw new DataError(/symbol|figi/i.test(msg) ? "Ticker not found. Use US symbols like KO or PEP." : /credit|limit/i.test(msg) ? "Twelve Data limit reached." : msg, /symbol/i.test(msg) ? "symbol" : /credit|limit/i.test(msg) ? "limit" : "other");
       }
       if (/^datetime[;,]/i.test(t)) {
         const lines = t.split(/\r?\n/), head = lines[0].split(/[;,]/).map(h => h.trim().toLowerCase());
@@ -1538,8 +1547,8 @@ if (typeof module !== "undefined") module.exports = Engine;
     if (payload && typeof payload === "object" && !rows.length) {
       if (payload.status === "error" || (payload.code && !payload.values)) {
         const code = Number(payload.code);
-        throw new DataError(code === 401 ? "Twelve Data didn't accept your key. Check it in settings." : code === 429 ? "Twelve Data limit reached (8 a minute). Wait a minute." :
-          code === 400 || code === 404 ? "Ticker not found. Use US symbols like KO or PEP." : String(payload.message || "Twelve Data error"), code === 401 ? "key" : "other");
+        throw new DataError(code === 401 ? "Twelve Data didn't accept your key. Check it in settings." : code === 429 ? (/day/i.test(String(payload.message)) ? "Twelve Data's daily credits are used up (they reset at midnight UTC)." : "Twelve Data limit reached (8 a minute).") :
+          code === 400 || code === 404 ? "Ticker not found. Use US symbols like KO or PEP." : String(payload.message || "Twelve Data error"), code === 401 ? "key" : code === 429 ? "limit" : "other");
       }
       rows = (payload.values || []).map(v => [v.datetime, Number(v.close)]);
     }
@@ -1567,13 +1576,47 @@ if (typeof module !== "undefined") module.exports = Engine;
     catch { throw new DataError("Couldn't reach Twelve Data. Check your connection."); }
     return parseBars(await r.json());
   }
-  async function daily(sym) { // cached ~6 years of daily closes, refreshed twice a day
+  function lastClosedSession() { // the latest weekday whose regular session has finished
+    const { ny, wd } = phaseNow();
+    let d = ny.day;
+    if (wd >= 5 || ny.min < CLOSE + 20) do { d = E.addDays(d, -1); } while (E.weekday(d) >= 5);
+    return d;
+  }
+  async function daily(sym) { // ~6 years of daily closes, saved in this browser; at most 1 credit per stock per day
     const c = local.get("td." + sym);
-    if (c && Date.now() - c.fetchedAt < 12 * 3600 * 1000) return c.series;
-    const series = {};
-    for (const [d, v] of await tdBars(sym, "1day", 1600)) series[d.slice(0, 10)] = v;
-    local.set("td." + sym, { fetchedAt: Date.now(), last: Object.keys(series).sort().pop(), series });
-    return series;
+    if (c && (c.last >= lastClosedSession() || Date.now() - c.fetchedAt < 12 * 3600 * 1000)) return c.series;
+    try {
+      const series = {};
+      for (const [d, v] of await tdBars(sym, "1day", 1600)) series[d.slice(0, 10)] = v;
+      local.set("td." + sym, { fetchedAt: Date.now(), last: Object.keys(series).sort().pop(), series });
+      return series;
+    } catch (e) {
+      if (c && e.kind !== "symbol") { S.fallback = e.message; return c.series; } // keep going on the saved history
+      throw e;
+    }
+  }
+  async function finnhubQuote(sym) {
+    const key = local.get("fhkey");
+    if (!key || inClaude) return null;
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${encodeURIComponent(key)}`);
+      const q = await r.json();
+      return q && q.c > 0 && q.t ? q : null;
+    } catch { return null; }
+  }
+  async function intraday(sym) { // today's 1-minute bars; a saved copy (or a Finnhub quote) stands in when Twelve Data can't answer
+    try {
+      const rows = await tdBars(sym, "1min", 390), day = rows[rows.length - 1][0].slice(0, 10);
+      local.set("bars." + sym, { day, rows: rows.filter(r => r[0].startsWith(day)) });
+      return rows;
+    } catch (e) {
+      if (e.kind === "key" || e.kind === "symbol") throw e;
+      const c = local.get("bars." + sym);
+      if (c && c.rows && c.rows.length) { S.fallback = e.message; return c.rows; }
+      const q = await finnhubQuote(sym);
+      if (q) { S.fallback = e.message; const ny = nyParts(q.t * 1000); return [[`${ny.day} ${pad2(ny.min / 60)}:${pad2(ny.min % 60)}:00`, q.c]]; }
+      throw e;
+    }
   }
 
   // ------------------------------------------------------------ Finnhub live trade stream
@@ -1615,6 +1658,8 @@ if (typeof module !== "undefined") module.exports = Engine;
     status: "idle", error: null, hist: null, model: null, session: null, prev: null,
     pts: [], last: {}, lastTick: 0, dirty: false, prec: null, mc: null, mcAt: 0, mcBusy: false, mcErr: null,
     sheet: null, watch: null, toast: null, loadId: 0,
+    open: new Set(), // which "more detail" sections the user has opened; kept across redraws
+    fallback: null, pauseUntil: 0, lastM: 0, savedAt: 0, // data-source fallbacks and the saved live line
   };
   const savedRisk = local.get("risk");
   if (savedRisk) S.cfg = { ...S.cfg, signal: { ...S.cfg.signal, ...(savedRisk.signal || {}) }, risk: { ...S.cfg.risk, ...(savedRisk.risk || {}) } };
@@ -1647,20 +1692,24 @@ if (typeof module !== "undefined") module.exports = Engine;
   async function loadPair(a, b, { silent = false } = {}) {
     const id = ++S.loadId;
     S.pair = [a, b]; savePrefs();
-    if (!silent) { S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.mc = null; S.mcErr = null; S.prec = null; S.model = null; S.facIn = null; S.fac = null; paint(true); }
+    if (!silent) { S.fallback = null; S.status = "loading"; S.error = null; S.pts = []; S.last = {}; S.mc = null; S.mcErr = null; S.prec = null; S.model = null; S.facIn = null; S.fac = null; paint(true); }
     try {
       const [ha, hb] = [await daily(a), await daily(b)];
-      const [ia, ib] = [await tdBars(a, "1min", 390), await tdBars(b, "1min", 390)];
+      const [ia, ib] = [await intraday(a), await intraday(b)];
       if (id !== S.loadId) return;
       const session = [ia[ia.length - 1][0], ib[ib.length - 1][0]].sort().pop().slice(0, 10);
-      const mapB = new Map(ib.filter(r => r[0].startsWith(session)).map(r => [r[0].slice(11, 16), r[1]]));
+      const minOf = dt => { const [h, m] = dt.slice(11, 16).split(":").map(Number); return h * 60 + m; };
+      const ra = ia.filter(r => r[0].startsWith(session)), rb = ib.filter(r => r[0].startsWith(session));
       const pts = [];
-      for (const [dt, pa] of ia) {
-        if (!dt.startsWith(session)) continue;
-        const pb = mapB.get(dt.slice(11, 16));
-        if (pb == null) continue;
-        const [h, m] = dt.slice(11, 16).split(":").map(Number);
-        pts.push({ m: h * 60 + m, a: pa, b: pb });
+      let j = 0;
+      for (const [dt, pa] of ra) { // pair each price of A with B's latest price at that minute
+        while (j + 1 < rb.length && rb[j + 1][0] <= dt) j++;
+        if (rb.length) pts.push({ m: minOf(dt), a: pa, b: rb[j][1] });
+      }
+      const kept = local.get("pts." + key([a, b])); // the live line saved earlier today in this browser
+      if (kept && kept.session === session) {
+        const lastM = pts.length ? pts[pts.length - 1].m : -1;
+        for (const p of kept.pts) if (p.m > lastM) pts.push(p);
       }
       if (!pts.length) throw new DataError("No trades today yet for this pair.");
       const lastPt = pts[pts.length - 1];
@@ -1673,7 +1722,10 @@ if (typeof module !== "undefined") module.exports = Engine;
       if (S.fromAlert) runModel(); else updateTrade(true);
     } catch (e) {
       if (id !== S.loadId) return;
-      if (silent && S.status === "ready") return; // keep showing the last good data
+      if (silent && S.status === "ready") { // keep showing the last good data
+        if (e.kind === "limit") { S.fallback = e.message; S.pauseUntil = Date.now() + 10 * 60000; paint(); }
+        return;
+      }
       S.status = "error"; S.error = { msg: e.message, kind: e.kind };
     }
     paint(!silent);
@@ -1682,22 +1734,38 @@ if (typeof module !== "undefined") module.exports = Engine;
   function onTrade(sym, price, t) {
     if (S.status !== "ready" || !S.last[sym] || !(price > 0)) return;
     const ny = nyParts(t);
-    if (ny.min < OPEN || ny.min > CLOSE) return; // pre-market and after-hours trades don't move the regular-session chart
-    if (ny.day !== S.session) { if (ny.day > S.session) loadPair(...S.pair); return; }
+    if (ny.min < PRE || ny.min > POST) return; // overnight prints (rare, off-exchange) are skipped
+    if (ny.day < S.session) return;
+    if (ny.day > S.session) rollSession(ny.day);
     S.last[sym] = { p: price, t };
+    S.lastM = ny.min;
+    if (!S.pts.length) S.pts.push({ m: ny.min, a: S.last[S.pair[0]].p, b: S.last[S.pair[1]].p }); // first point of a new day
     S.lastTick = Date.now(); S.dirty = true;
   }
   setInterval(() => { // fold the latest trades into the chart every 2 seconds
     if (!S.dirty || S.status !== "ready") return;
     S.dirty = false;
     const [a, b] = S.pair, ny = nyParts(Date.now());
-    const pt = { m: Math.min(ny.min, CLOSE), a: S.last[a].p, b: S.last[b].p };
+    const pt = { m: S.lastM || ny.min, a: S.last[a].p, b: S.last[b].p };
     const prev = S.pts[S.pts.length - 1];
     if (prev && pt.m - prev.m < 5 / 60) S.pts[S.pts.length - 1] = pt; else S.pts.push(pt);
     if (S.pts.length > 4000) S.pts = S.pts.filter((_, i) => i % 2 === 0);
+    if (Date.now() - S.savedAt > 30000) savePts();
     updateTrade(false);
     paint();
   }, 2000);
+  function savePts() { // keep today's live line so a reload (or a Twelve Data outage) doesn't lose it
+    S.savedAt = Date.now();
+    const n = Math.ceil(S.pts.length / 1500), pts = n > 1 ? S.pts.filter((_, i) => i % n === 0 || i === S.pts.length - 1) : S.pts;
+    local.set("pts." + key(S.pair), { session: S.session, pts: pts.map(p => ({ m: +p.m.toFixed(2), a: p.a, b: p.b })) });
+  }
+  function rollSession(day) { // first trade of a new day: start a fresh line from yesterday's close, no new downloads
+    const [a, b] = S.pair, reg = S.pts.filter(p => p.m <= CLOSE), lp = reg[reg.length - 1];
+    if (lp) { S.hist[a] = { ...S.hist[a], [S.session]: lp.a }; S.hist[b] = { ...S.hist[b], [S.session]: lp.b }; }
+    try { S.model = buildModel(a, b, S.hist[a], S.hist[b], day, S.last[a].p, S.last[b].p); } catch { return; }
+    S.session = day; S.pts = []; S.prec = null; S.mc = null; S.fac = null; S.facIn = null; S.mcErr = null;
+    loadFactors(a, b, day, S.loadId);
+  }
   setInterval(() => { if (S.status === "ready") paint(); }, 15000); // keep "updated Xs ago" honest when quiet
 
   // ------------------------------------------------------------ market factors: earnings, news, S&P 500
@@ -1730,7 +1798,8 @@ if (typeof module !== "undefined") module.exports = Engine;
   }
 
   // ------------------------------------------------------------ options model: Monte Carlo over every call/put combination
-  const isSignal = () => S.status === "ready" && S.model.sig.eligible && Math.abs(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) >= S.cfg.signal.entry_z;
+  const inRegular = () => { const l = S.pts[S.pts.length - 1]; return !!l && l.m >= OPEN && l.m <= CLOSE + 1; };
+  const isSignal = () => S.status === "ready" && inRegular() && S.model.sig.eligible && Math.abs(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) >= S.cfg.signal.entry_z;
   function updateTrade(force) { if (isSignal() && (force || !S.mc || Date.now() - S.mcAt > 60000)) runModel(); } // re-run at most once a minute
   function runModel() {
     if (S.status !== "ready" || S.mcBusy) return;
@@ -1766,10 +1835,21 @@ if (typeof module !== "undefined") module.exports = Engine;
   // ------------------------------------------------------------ charts
   const W = 720;
   function axis(h, pb) {
-    const X = m => 8 + (W - 64) * (Math.min(Math.max(m, OPEN), CLOSE) - OPEN) / (CLOSE - OPEN);
+    const ph = phaseNow().phase;
+    const ext = S.pts.some(p => p.m < OPEN || p.m > CLOSE) || ((ph === "pre" || ph === "post") && Live.state === "open");
+    if (!ext) {
+      const X = m => 8 + (W - 64) * (Math.min(Math.max(m, OPEN), CLOSE) - OPEN) / (CLOSE - OPEN);
+      let s = "";
+      for (const [m, l] of [[OPEN, "9:30"], [720, "12:00"], [CLOSE, "4:00 ET"]]) s += `<text x="${X(m).toFixed(1)}" y="${h - 4}" text-anchor="${m === OPEN ? "start" : m === CLOSE ? "end" : "middle"}">${l}</text>`;
+      return { X, s, bg: "" };
+    }
+    // pre-market and after-hours get narrow shaded strips either side of the regular session
+    const segs = [[PRE, OPEN, 0, 0.17], [OPEN, CLOSE, 0.17, 0.83], [CLOSE, POST, 0.83, 1]];
+    const X = m => { m = Math.min(Math.max(m, PRE), POST); const g = segs.find(q => m <= q[1]); return 8 + (W - 64) * (g[2] + (g[3] - g[2]) * (m - g[0]) / (g[1] - g[0])); };
     let s = "";
-    for (const [m, l] of [[OPEN, "9:30"], [720, "12:00"], [CLOSE, "4:00 ET"]]) s += `<text x="${X(m).toFixed(1)}" y="${h - 4}" text-anchor="${m === OPEN ? "start" : m === CLOSE ? "end" : "middle"}">${l}</text>`;
-    return { X, s };
+    for (const [m, l, an] of [[PRE, "4:00", "start"], [OPEN, "9:30", "middle"], [CLOSE, "4:00", "middle"], [POST, "8:00 ET", "end"]]) s += `<text x="${X(m).toFixed(1)}" y="${h - 4}" text-anchor="${an}">${l}</text>`;
+    const strip = (m0, m1, t) => `<rect class="ext" x="${X(m0).toFixed(1)}" y="0" width="${(X(m1) - X(m0)).toFixed(1)}" height="${h - pb}"/><text class="ext-t" x="${((X(m0) + X(m1)) / 2).toFixed(1)}" y="12" text-anchor="middle">${t}</text>`;
+    return { X, s, bg: strip(PRE, OPEN, "Pre") + strip(CLOSE, POST, "After") };
   }
   function pathOf(pts, X, Y, f) { return pts.map((p, i) => `${i ? "L" : "M"}${X(p.m).toFixed(1)},${Y(f(p)).toFixed(1)}`).join(""); }
 
@@ -1778,9 +1858,9 @@ if (typeof module !== "undefined") module.exports = Engine;
     const ca = p => p.a / M.prevA - 1, cb = p => p.b / M.prevB - 1;
     const vals = S.pts.flatMap(p => [ca(p), cb(p)]);
     let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals); const pad = Math.max((hi - lo) * 0.12, 0.002); lo -= pad; hi += pad;
-    const { X, s: ax } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v - lo) / (hi - lo));
+    const { X, s: ax, bg } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v - lo) / (hi - lo));
     const last = S.pts[S.pts.length - 1];
-    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(a)} and ${esc(b)} change today">
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(a)} and ${esc(b)} change today">${bg}
       <line class="zero" x1="8" x2="${W - 56}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}"/>
       <path class="ln-b" d="${pathOf(S.pts, X, Y, cb)}"/><path class="ln-a" d="${pathOf(S.pts, X, Y, ca)}"/>
       <circle class="dot live" cx="${X(last.m).toFixed(1)}" cy="${Y(ca(last)).toFixed(1)}" r="4.5"/>
@@ -1793,11 +1873,11 @@ if (typeof module !== "undefined") module.exports = Engine;
   function driftChart() {
     const H = 230, pt = 10, pb = 22, zs = S.pts.map(p => zOf(p.a, p.b));
     const lim = Math.max(2.6, ...zs.map(z => Math.abs(z) + 0.3));
-    const { X, s: ax } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v + lim) / (2 * lim));
+    const { X, s: ax, bg } = axis(H, pb), Y = v => pt + (H - pt - pb) * (1 - (v + lim) / (2 * lim));
     const band = (y0, y1, cls) => `<rect class="${cls}" x="8" width="${W - 64}" y="${Y(y1).toFixed(1)}" height="${(Y(y0) - Y(y1)).toFixed(1)}"/>`;
     const last = S.pts[S.pts.length - 1], zl = zs[zs.length - 1];
     let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Drift in standard deviations">`;
-    s += band(2, lim, "zone-out") + band(-lim, -2, "zone-out") + band(1, 2, "zone-2") + band(-2, -1, "zone-2") + band(-1, 1, "zone-1");
+    s += band(2, lim, "zone-out") + band(-lim, -2, "zone-out") + band(1, 2, "zone-2") + band(-2, -1, "zone-2") + band(-1, 1, "zone-1") + bg;
     for (const v of [2, 1, 0, -1, -2]) s += `<line class="${v ? "band-l" : "zero"}" x1="8" x2="${W - 56}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/><text x="${W - 50}" y="${(Y(v) + 4).toFixed(1)}">${v ? (v > 0 ? "+" : "−") + Math.abs(v) + "σ" : "0"}</text>`;
     s += `<path class="ln-z" d="${pathOf(S.pts.map((p, i) => ({ m: p.m, z: zs[i] })), X, Y, p => p.z)}"/>`;
     s += `<circle class="dot live" cx="${X(last.m).toFixed(1)}" cy="${Y(zl).toFixed(1)}" r="5"/>`;
@@ -1805,12 +1885,19 @@ if (typeof module !== "undefined") module.exports = Engine;
   }
 
   // ------------------------------------------------------------ view
+  function nextLive() { // when trading (pre-market) starts again
+    const { ny, wd } = phaseNow();
+    let d = ny.day;
+    if (wd >= 5 || ny.min >= POST) do { d = E.addDays(d, 1); } while (E.weekday(d) >= 5);
+    return d === ny.day ? "4:00 ET" : `${new Date(d + "T00:00:00Z").toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" })} 4:00 ET`;
+  }
   function liveBadge() {
-    const ny = nyParts(Date.now()), open = ny.day === S.session && ny.min >= OPEN && ny.min <= CLOSE && new Date().getUTCDay() % 6 !== 0;
-    if (inClaude) return `<span class="pill">Refreshes every minute</span>`;
+    const ph = phaseNow().phase;
+    if (inClaude) return `<span class="pill">${S.pauseUntil > Date.now() ? "Paused · Twelve Data limit" : ph === "open" ? "Refreshes every minute" : `Market closed · ${esc(dDay(S.session))}`}</span>`;
     if (!local.get("fhkey")) return `<button class="pill warn-pill" data-act="sheet" data-s="settings">Live off · add Finnhub key</button>`;
-    if (!open) return `<span class="pill">Market closed · ${esc(dDay(S.session))}</span>`;
-    if (Live.state === "open") return `<span class="pill up pulse">Live${S.lastTick ? ` · ${esc(ago(S.lastTick))}` : ""}</span>`;
+    if (ph === "closed") return `<span class="pill">Closed · live again ${esc(nextLive())}</span>`;
+    const tag = ph === "pre" ? "Pre-market" : ph === "post" ? "After hours" : "Live";
+    if (Live.state === "open") return `<span class="pill up pulse">${tag}${S.lastTick ? ` · ${esc(ago(S.lastTick))}` : ""}</span>`;
     return `<span class="pill drift">${Live.state === "connecting" ? "Connecting…" : "Reconnecting…"}</span>`;
   }
 
@@ -1831,6 +1918,7 @@ if (typeof module !== "undefined") module.exports = Engine;
             <div><span class="sym"><i class="sw b"></i>${esc(b)}</span><span class="px">${cents(lb)}</span><span class="${chg(lb, M.prevB) >= 0 ? "up" : "down"} small">${pct(chg(lb, M.prevB))}</span></div>
           </div>${liveBadge()}</div>
         ${priceChart()}
+        ${S.fallback ? `<p class="note">${esc(S.fallback)} ${inClaude ? "Showing the last prices; trying again in a few minutes." : "Using prices saved in this browser; live updates keep coming from Finnhub."}</p>` : ""}
       </section>
       <section class="card">
         <div class="head"><div><span class="label">Drift between them</span><div class="big ${band[1]}">${zf(z)}σ</div>
@@ -1840,7 +1928,7 @@ if (typeof module !== "undefined") module.exports = Engine;
         <div class="legend"><span><i class="zk z1"></i>Within 1σ (normal)</span><span><i class="zk z2"></i>1–2σ</span><span><i class="zk zo"></i>Beyond ${entry}σ: trade signal</span></div>
         ${unstable ? `<p class="note warn">This pair isn't moving together reliably right now (${esc(M.sig.reasons[0])}), so drift here isn't a signal.</p>` : ""}
       </section>
-      ${viewModel(z)}`;
+`;
   }
 
   const legLine = l => `<div class="leg"><span class="tag ${l.right === "C" ? "call" : "put"}">${l.right === "C" ? "CALL" : "PUT"}</span>
@@ -1944,10 +2032,10 @@ if (typeof module !== "undefined") module.exports = Engine;
       <div><div class="label">All ${plan.combos.toLocaleString()} combinations</div>${cloudChart(plan)}
         <div class="legend"><span><i class="cdk best"></i>Suggested</span><span><i class="cdk pair"></i>Balanced pairs trades</span><span><i class="cdk"></i>Other combinations</span>${lead && !lead.aligned ? `<span><i class="cdk lead"></i>Top overall</span>` : ""}</div></div>
       ${lead && !lead.aligned && lead.score > c.score ? `<p class="note">Highest-scoring overall: <b>${esc(comboName(lead))}</b> (${pct(lead.score, 0)} expected return). It's a bet on the market's direction, not a hedged pairs trade, so it isn't suggested.</p>` : ""}
-      <details><summary>Fixed scenarios for the suggested trade</summary><div class="list">${det}</div>
+      <details data-k="scen" ${S.open.has("scen") ? "open" : ""}><summary>Fixed scenarios for the suggested trade</summary><div class="list">${det}</div>
         <p class="note">Greeks: ${money(c.greeks.delta_per_1pct, true)} per 1% move in both stocks · time decay ${money(c.greeks.theta_per_day, true)}/day · ${money(c.greeks.vega_per_point, true)} per volatility point.</p></details>
-      ${plan.top.length > 1 ? `<details><summary>Runners-up</summary><div class="list">${plan.top.slice(1).map(r => `<div class="item" style="cursor:default"><span><span class="t">${esc(comboName(r))}</span><span class="s">max loss ${money(r.cost)} · win chance ${pct(r.pop, 0, false)}</span></span><span class="r ${r.ev >= 0 ? "up" : "down"}">${money(r.ev, true)}</span></div>`).join("")}</div></details>` : ""}
-      <details><summary>Model inputs</summary><p class="note">
+      ${plan.top.length > 1 ? `<details data-k="runners" ${S.open.has("runners") ? "open" : ""}><summary>Runners-up</summary><div class="list">${plan.top.slice(1).map(r => `<div class="item" style="cursor:default"><span><span class="t">${esc(comboName(r))}</span><span class="s">max loss ${money(r.cost)} · win chance ${pct(r.pop, 0, false)}</span></span><span class="r ${r.ev >= 0 ? "up" : "down"}">${money(r.ev, true)}</span></div>`).join("")}</div></details>` : ""}
+      <details data-k="inputs" ${S.open.has("inputs") ? "open" : ""}><summary>Model inputs</summary><p class="note">
         Hedge ratio ${cal.beta.toFixed(2)} (±${(2 * cal.beta_se).toFixed(2)}) · gap half-life ${Number.isFinite(cal.half_life) ? cal.half_life.toFixed(1) + " days" : "none"} · correlation ${cal.correlation.toFixed(2)} · Dickey-Fuller t ${cal.adf_t.toFixed(2)} ·
         ${esc(S.pair[1])} daily volatility ${pct(cal.daily_vol_b, 2, false)} · ${cal.history_days} historical days replayed.<br>
         Regimes: ${plan.regimes.map(r => `${esc(r.name)} ${pct(r.weight, 0, false)}`).join(", ")}.<br>
@@ -2011,12 +2099,16 @@ if (typeof module !== "undefined") module.exports = Engine;
             <option value="__add">+ Add a pair…</option></select></div>
           <button class="icon-btn" data-act="sheet" data-s="settings" aria-label="Settings">${ICON.gear}</button>
         </div></header>
-        <main id="live"></main>
+        <main><div id="live" style="display:contents"></div><div id="model-root" style="display:contents"></div></main>
         <p class="foot" id="watch-line"></p>
         <div id="sheet-root"></div><div id="toast-root"></div>`;
     }
     const needKeys = !inClaude && !local.get("tdkey");
     document.getElementById("live").innerHTML = needKeys ? setupView() : viewPair();
+    // The model card only redraws when its content changes, so open sections, hover and text selection survive live ticks.
+    const mh = !needKeys && S.status === "ready" ? viewModel(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) : "";
+    const mr = document.getElementById("model-root");
+    if (mr._html !== mh) { mr.innerHTML = mh; mr._html = mh; }
     document.getElementById("watch-line").innerHTML = `${watchLine()}<br>Paper analysis only · option prices modeled · not financial advice`;
     const sr = document.getElementById("sheet-root");
     if (sr.dataset.sheet !== (S.sheet || "")) { sr.innerHTML = sheetView(); sr.dataset.sheet = S.sheet || ""; }
@@ -2064,6 +2156,10 @@ if (typeof module !== "undefined") module.exports = Engine;
       loadPair(...S.pair);
     }
   });
+  app.addEventListener("toggle", ev => { // remember opened sections (toggle doesn't bubble, so listen while capturing)
+    const k = ev.target.dataset && ev.target.dataset.k;
+    if (k) { if (ev.target.open) S.open.add(k); else S.open.delete(k); }
+  }, true);
   app.addEventListener("keydown", ev => { if (ev.key === "Escape" && S.sheet) { S.sheet = null; paint(); } });
 
   // ------------------------------------------------------------ boot
@@ -2074,7 +2170,9 @@ if (typeof module !== "undefined") module.exports = Engine;
   fetchWatch();
   ensureNames([...new Set(pairList().flatMap(x => x.p))]);
   setInterval(fetchWatch, 60000);
-  if (inClaude) setInterval(() => { if (S.status === "ready" && document.visibilityState === "visible") loadPair(...S.pair, { silent: true }); }, 60000);
+  if (inClaude) setInterval(() => { // Twelve Data has no extended hours on the free plan, so only refresh while the market is open
+    if (S.status === "ready" && document.visibilityState === "visible" && phaseNow().phase === "open" && Date.now() > S.pauseUntil) loadPair(...S.pair, { silent: true });
+  }, 60000);
 })();
 </script>
 </body></html>
