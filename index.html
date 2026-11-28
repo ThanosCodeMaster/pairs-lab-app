@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-0Gb/fVX1hSsWvV75ZC36esOJpxyWrMyvesasl3PZzi0=' 'sha256-vqdUtIQ8+nb62Eh1p3uLajzD/OYc4JPhdAXW5F0Ubp4='; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://api.twelvedata.com https://finnhub.io wss://ws.finnhub.io https://api.marketdata.app https://ntfy.sh; img-src data:; base-uri 'none'; form-action 'none'; object-src 'none'"><meta name="referrer" content="no-referrer"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Pairs Lab</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <meta name="description" content="Practice pairs trading with options using paper money. Educational, not financial advice.">
@@ -1910,7 +1910,7 @@ if (typeof module !== "undefined") module.exports = Engine;
       if (ec && Array.isArray(ec.earningsCalendar)) earnings[sym] = ec.earningsCalendar.filter(r => r.date).map(r => ({ date: r.date, hour: r.hour || "" }));
       else haveE = false;
       const nw = await finnhub("company-news", { symbol: sym, from: nfrom, to: session });
-      if (Array.isArray(nw)) news[sym] = nw.filter(n => n.datetime && n.headline).map(n => ({ datetime: n.datetime, headline: n.headline, url: n.url || "" }));
+      if (Array.isArray(nw)) news[sym] = nw.filter(n => n.datetime && n.headline).map(n => ({ datetime: n.datetime, headline: n.headline, url: /^https?:\/\//i.test(n.url || "") ? n.url : "" })); // only web links (never javascript: or data:)
       else haveN = false;
     }
     let market = null;
