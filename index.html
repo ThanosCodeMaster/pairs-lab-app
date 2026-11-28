@@ -2193,7 +2193,9 @@ if (typeof module !== "undefined") module.exports = Engine;
     if (inClaude) return `Live streaming runs at <a href="${PAGES_URL}" target="_blank" rel="noopener">${esc(PAGES_URL.replace("https://", "").replace(/\/$/, ""))}</a>`;
     if (!w) return local.get("ntfytopic") ? "Watcher: no status yet" : "Phone alerts: add your alert topic in settings to see the watcher here";
     const last = new Date(w.last || w.at).getTime(), stale = w.open && Date.now() - last > 25 * 60000;
-    return `Watcher ${w.open ? (stale ? "delayed" : "live") : "idle (market closed)"} · last check ${esc(ago(last))} · ${plural((w.alerts || []).length, "alert")} sent recently`;
+    const f = w.open && w.feed, src = f && f.src ? ` · prices from ${esc(f.src)}${f.age != null ? ` (${f.age < 1 ? "under a minute" : `${Math.round(f.age)} min`} old)` : ""}` : "";
+    const prob = f && f.problems && f.problems.length ? ` · <span class="drift">${esc(f.problems[0])}</span>` : "";
+    return `Watcher ${w.open ? (stale ? "delayed" : "live") : "idle (market closed)"} · last check ${esc(ago(last))}${src} · ${plural((w.alerts || []).length, "alert")} sent recently${prob}`;
   }
 
   function sheetView() {
@@ -2251,7 +2253,7 @@ if (typeof module !== "undefined") module.exports = Engine;
     const mh = !needKeys && S.status === "ready" ? viewModel(zOf(S.last[S.pair[0]].p, S.last[S.pair[1]].p)) : "";
     const mr = document.getElementById("model-root");
     if (mr._html !== mh) { mr.innerHTML = mh; mr._html = mh; }
-    document.getElementById("watch-line").innerHTML = `${watchLine()}<br>Paper analysis only · option prices modeled · not financial advice`;
+    document.getElementById("watch-line").innerHTML = `${watchLine()}<br>Paper analysis only · not financial advice`;
     const sr = document.getElementById("sheet-root");
     if (sr.dataset.sheet !== (S.sheet || "")) { sr.innerHTML = sheetView(); sr.dataset.sheet = S.sheet || ""; }
     document.getElementById("toast-root").innerHTML = S.toast ? `<div class="toast" role="status">${esc(S.toast)}</div>` : "";
