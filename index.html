@@ -1883,6 +1883,7 @@ if (typeof module !== "undefined") module.exports = Engine;
       } catch { return saved && saved.payload ? { ...saved, stale: true } : { error: "couldn't reach MarketData.app" }; }
       const later = r.status === 402 && /latest available is (\d{4}-\d{2}-\d{2})/.exec(body.errmsg || "");
       if (later && later[1] < d) { d = later[1]; continue; } // free plan: sessions are served a day after they close
+      if (body.s === "no_data") { do { d = E.addDays(d, -1); } while (E.weekday(d) >= 5); continue; } // holiday (answered with a 404)
       if (!r.ok) {
         const why = { 401: "MarketData.app didn't accept your token", 402: "not on your MarketData.app plan", 403: "your MarketData.app token is in use from another place (the cloud watcher?); try again in 5 minutes", 429: "MarketData.app's daily credits are used up" }[r.status] || `MarketData.app error ${r.status}`;
         return saved && saved.payload ? { ...saved, stale: true, note: why } : { error: why };
