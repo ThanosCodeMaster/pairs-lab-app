@@ -488,6 +488,90 @@ const Engine = (() => {
              options: new SyntheticOptions(dates, closes, rate, { source: "MODEL (from real stock prices)", noise: false }) };
   }
 
+  // ---------------------------------------------------------------- real option chains (MarketData.app)
+  // Mirror of statarb/data/realchain.py. The free plan serves the last closed session's chain (real
+  // bids, asks, volume, open interest; no implied volatility). Each contract's volatility is solved
+  // from its real midpoint at that close; later, contracts are re-priced at today's stock price with
+  // that volatility, keeping the real bid/ask spread. Nothing moved: the real bid and ask exactly.
+  const REAL_SOURCE = "MarketData.app";
+  const nyDate = unix => new Date((unix - 4 * 3600) * 1000).toISOString().slice(0, 10);
+  function parseChain(payload, symbol) {
+    if (!payload || payload.s !== "ok") return null;
+    const n = (payload.strike || []).length, col = k => payload[k] || new Array(n).fill(null);
+    const [exp, side, strike, bid, ask, vol, oi, upd, und] = ["expiration", "side", "strike", "bid", "ask", "volume", "openInterest", "updated", "underlyingPrice"].map(col);
+    const rows = [], stamps = [], spots = [];
+    for (let i = 0; i < n; i++) {
+      if ([exp[i], side[i], strike[i], bid[i], ask[i]].some(v => v == null) || (side[i] !== "call" && side[i] !== "put")) continue;
+      rows.push({ expiry: nyDate(exp[i]), strike: +strike[i], right: side[i] === "call" ? CALL : PUT, bid: +bid[i], ask: +ask[i],
+                  volume: Math.trunc(vol[i] || 0), open_interest: Math.trunc(oi[i] || 0) });
+      if (upd[i] != null) stamps.push(upd[i]);
+      if (und[i] != null) spots.push(+und[i]);
+    }
+    if (!rows.length || !stamps.length || !spots.length) return null;
+    rows.sort((x, y) => (x.expiry < y.expiry ? -1 : x.expiry > y.expiry ? 1 : 0) || (x.right < y.right ? -1 : x.right > y.right ? 1 : 0) || x.strike - y.strike);
+    return { symbol, quote_date: nyDate(Math.max(...stamps)), underlying_price: spots[0], rows };
+  }
+  class RealOptions {
+    constructor(chains, dates, closes, rate, fallback) {
+      this.chains = chains; this.closes = closes; this.rate = rate; this.fallback = fallback;
+      this.idx = new Map(dates.map((d, i) => [d, i]));
+    }
+    spot(sym, d) { const i = this.idx.get(d); if (i == null || !this.closes[sym]) return null; const v = this.closes[sym][i]; return Number.isNaN(v) ? null : v; }
+    row(ch, expiry, strike, right, spot) {
+      const tol = strikeStep(spot) / 2 + 1e-9;
+      let best = null, bk = null;
+      for (const r of ch.rows) {
+        const de = Math.abs(daysBetween(expiry, r.expiry));
+        if (r.right !== right || de > 1 || Math.abs(r.strike - strike) > tol) continue;
+        const k = [de, Math.abs(r.strike - strike), r.strike];
+        if (!bk || k[0] < bk[0] || (k[0] === bk[0] && (k[1] < bk[1] || (k[1] === bk[1] && k[2] < bk[2])))) { best = r; bk = k; }
+      }
+      return best;
+    }
+    make(ch, r, d, spot) {
+      if (r.bid <= 0 || r.ask <= 0 || r.ask < r.bid) return null;
+      const t0 = daysBetween(ch.quote_date, r.expiry) / 365, t1 = daysBetween(d, r.expiry) / 365;
+      if (t0 <= 0 || t1 <= 0) return null;
+      const iv = impliedVol((r.bid + r.ask) / 2, ch.underlying_price, r.strike, t0, this.rate, r.right);
+      if (iv == null) return null;
+      let bid = r.bid, ask = r.ask;
+      if (!(d === ch.quote_date && Math.abs(spot - ch.underlying_price) < 1e-9)) {
+        const mid = bsPrice(spot, r.strike, t1, this.rate, iv, r.right), half = (r.ask - r.bid) / 2;
+        bid = Math.max(mid - half, 0); ask = Math.max(mid + half, 0.01);
+      }
+      return { underlying: ch.symbol, quote_date: d, expiry: r.expiry, strike: r.strike, right: r.right, bid, ask, iv,
+               volume: r.volume, open_interest: r.open_interest, as_of: `${ch.quote_date} 16:00`, delay_minutes: null,
+               source: `${REAL_SOURCE} (${ch.quote_date} close)`, modeled: false };
+    }
+    quote(sym, d, expiry, strike, right) {
+      const ch = this.chains[sym];
+      if (!ch) return this.fallback.quote(sym, d, expiry, strike, right);
+      const spot = this.spot(sym, d);
+      if (spot == null || expiry <= d) return null;
+      const r = this.row(ch, expiry, strike, right, spot);
+      return r ? this.make(ch, r, d, spot) : null;
+    }
+    chain(sym, d) {
+      const ch = this.chains[sym];
+      if (!ch) return this.fallback.chain(sym, d);
+      const spot = this.spot(sym, d);
+      if (spot == null) return [];
+      return ch.rows.filter(r => r.expiry > d).map(r => this.make(ch, r, d, spot)).filter(Boolean);
+    }
+  }
+  function withRealChains(md, chains) {
+    const use = {};
+    for (const [s, c] of Object.entries(chains || {})) if (c && md.closes[s]) use[s] = c;
+    if (!Object.keys(use).length) return md;
+    return { ...md, options: new RealOptions(use, md.dates, md.closes, md.rate, md.options),
+             options_modeled: Object.keys(md.closes).some(s => !use[s]) };
+  }
+  function chainRequest(symbol, session, spot) { // one closed session, expiries 2-19 weeks out, strikes within 15%
+    const step = strikeStep(spot), g = v => String(+v.toFixed(6));
+    return { date: session, from: addDays(session, 14), to: addDays(session, 130),
+             strike: `${g(Math.trunc(spot * 0.85 / step) * step)}-${g((Math.trunc(spot * 1.15 / step) + 1) * step)}` };
+  }
+
   // ---------------------------------------------------------------- CSV import / export
   function parseCsv(text) {
     const rows = []; let row = [], field = "", q = false;
@@ -1262,9 +1346,12 @@ const Engine = (() => {
       for (const [sym, S] of [[a, SA], [b, SB]]) {
         const spot = md.closes[sym][t], step = strikeStep(spot);
         const ks = [...new Set(MC.strikes.map(f => Math.floor(spot * f / step + 0.5) * step))].sort((x, y) => x - y);
-        for (const right of [CALL, PUT]) for (const k of ks) {
-          const q = md.options.quote(sym, d0, e, k, right);
-          if (!q || q.ask == null || q.ask <= 0 || q.iv == null) continue;
+        const seen = new Set();
+        for (const right of [CALL, PUT]) for (const k0 of ks) {
+          const q = md.options.quote(sym, d0, e, k0, right);
+          if (!q || q.ask == null || q.ask <= 0 || q.iv == null || seen.has(right + q.strike)) continue;
+          seen.add(right + q.strike); // real chains: two targets can land on the same listed strike
+          const k = q.strike;
           const buy = buyPrice(q, cfg.costs), exitCost = (qSpread(q) || 0) / 2 + slippage(q, cfg.costs);
           const dd = Math.abs(bsGreeks(spot, k, dte / 365, rate, q.iv, right).delta) * spot;
           const net = new Float64Array(nPaths);
@@ -1436,7 +1523,7 @@ const Engine = (() => {
     makeSynthetic, fromSeries, loadCsv, exportCsv, parseCsv, truncated, assess, mdClose,
     computeSignal, signalSeries, ols, dickeyFuller, logs,
     slippage, buyPrice, sellPrice, fees, roundTripCost, checkLiquidity, checkParticipation, checkPortfolio, maxLossBudget,
-    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig, monteCarloPlan, buildFactors, addBusdays,
+    propose, walkForward, computeMetrics, Simulator, findDrifts, precedent, precedentConfig, monteCarloPlan, buildFactors, addBusdays, parseChain, withRealChains, chainRequest,
     newLedger, ledgerMarks, ledgerState, paperScan, paperConfirm, paperClose, PaperError,
     qKey, qDte, qMid, qSpread, qSpreadPct, daysBetween, addDays, weekday,
     LIVE_TRADING_AVAILABLE, submitLiveOrder,
@@ -1778,7 +1865,40 @@ if (typeof module !== "undefined") module.exports = Engine;
       return await r.json();
     } catch { return null; }
   }
+  // ------------------------------------------------------------ real option chains (MarketData.app, last closed session)
+  const MD_FIELDS = ["s", "expiration", "side", "strike", "bid", "ask", "volume", "openInterest", "updated", "underlyingPrice"];
+  async function optionChain(sym, spot) { // -> {payload} or {error}
+    const key = local.get("mdkey");
+    if (inClaude) return { error: "real option quotes load at your web address" };
+    if (!key) return { error: "add a MarketData.app token in settings for real quotes" };
+    const want = lastClosedSession(), saved = local.get("chain." + sym);
+    if (saved && saved.for === want && saved.payload) return saved;
+    let d = want;
+    for (let i = 0; i < 5; i++) {
+      let r, body;
+      try {
+        r = await fetch(`https://api.marketdata.app/v1/options/chain/${encodeURIComponent(sym)}/?${new URLSearchParams(E.chainRequest(sym, d, spot))}`,
+                        { headers: { Authorization: `Bearer ${key}`, Accept: "application/json" } });
+        body = await r.json().catch(() => ({}));
+      } catch { return saved && saved.payload ? { ...saved, stale: true } : { error: "couldn't reach MarketData.app" }; }
+      if (!r.ok) {
+        const why = { 401: "MarketData.app didn't accept your token", 402: "not on your MarketData.app plan", 403: "your MarketData.app token is in use from another place (the cloud watcher?); try again in 5 minutes", 429: "MarketData.app's daily credits are used up" }[r.status] || `MarketData.app error ${r.status}`;
+        return saved && saved.payload ? { ...saved, stale: true, note: why } : { error: why };
+      }
+      if (body.s === "ok") {
+        const payload = Object.fromEntries(MD_FIELDS.map(k => [k, body[k]]));
+        const out = { for: want, payload };
+        local.set("chain." + sym, out);
+        return out;
+      }
+      if (body.s !== "no_data") return { error: `MarketData.app: ${body.errmsg || "unexpected answer"}` };
+      do { d = E.addDays(d, -1); } while (E.weekday(d) >= 5); // holiday or not published yet: one session earlier
+    }
+    return { error: `no option chain for ${sym} in the last 5 sessions` };
+  }
+
   async function loadFactors(a, b, session, id) {
+    const chainsP = Promise.all([a, b].map(sym => optionChain(sym, S.last[sym] ? S.last[sym].p : S.hist[sym][Object.keys(S.hist[sym]).sort().pop()])));
     const from = E.addDays(session, -3 * 365), to = E.addDays(session, 60), nfrom = E.addDays(session, -33);
     const earnings = {}, news = {};
     let haveE = true, haveN = true;
@@ -1792,8 +1912,14 @@ if (typeof module !== "undefined") module.exports = Engine;
     }
     let market = null;
     try { market = await daily("SPY"); } catch { market = null; }
+    const got = await chainsP, chains = {}, chainProblems = [];
+    [a, b].forEach((sym, i) => {
+      const c = got[i], ch = c.payload ? E.parseChain(c.payload, sym) : null;
+      if (ch) chains[sym] = ch; else chainProblems.push(c.error || `no usable option quotes for ${sym}`);
+      if (c.note) chainProblems.push(c.note + " (using the saved chain)");
+    });
     if (id !== S.loadId) return;
-    S.facIn = { earnings: haveE ? earnings : null, news: haveN ? news : null, market, stamp: Date.now() };
+    S.facIn = { earnings: haveE ? earnings : null, news: haveN ? news : null, market, chains, chainProblems: [...new Set(chainProblems)], stamp: Date.now() };
     if (S.mc && !S.mcBusy) runModel(); // fold the factors into the current analysis
   }
 
@@ -1808,7 +1934,7 @@ if (typeof module !== "undefined") module.exports = Engine;
     setTimeout(() => {
       try {
         const [a, b] = S.pair;
-        const md = buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md;
+        const md = E.withRealChains(buildModel(a, b, S.hist[a], S.hist[b], S.session, S.last[a].p, S.last[b].p).md, (S.facIn && S.facIn.chains) || {});
         if (!S.prec) S.prec = E.precedent(md, S.pair, S.cfg);
         const fi = S.facIn || {};
         const fac = E.buildFactors(md, S.pair, md.dates.length - 1, S.cfg, fi.earnings || null, fi.news || null, fi.market || null);
@@ -1932,7 +2058,8 @@ if (typeof module !== "undefined") module.exports = Engine;
   }
 
   const legLine = l => `<div class="leg"><span class="tag ${l.right === "C" ? "call" : "put"}">${l.right === "C" ? "CALL" : "PUT"}</span>
-    <div><div class="t">Buy ${l.contracts} ${esc(l.symbol)} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}</div><div class="s">$${l.strike} strike · expires ${dShort(l.expiry)}</div></div>
+    <div><div class="t">Buy ${l.contracts} ${esc(l.symbol)} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""}</div><div class="s">$${l.strike} strike · expires ${dShort(l.expiry)}${l.quote && !l.quote.modeled
+      ? ` · bid ${cents(l.quote.bid)} / ask ${cents(l.quote.ask)} · ${l.quote.open_interest.toLocaleString()} open · IV ${pct(l.quote.iv, 0, false)}` : ""}</div></div>
     <div class="r">${money(l.entry_price * 100 * l.contracts)}</div></div>`;
   const comboName = c => c.legs.map(l => `${l.contracts} ${l.symbol} ${l.right === "C" ? "call" : "put"}${l.contracts > 1 ? "s" : ""} $${l.strike}`).join(" + ");
 
@@ -1990,6 +2117,16 @@ if (typeof module !== "undefined") module.exports = Engine;
       ${f.missing.length ? `<p class="note">Not checked: ${esc(f.missing.join(", "))}${inClaude ? " (available at your web address)" : !local.get("fhkey") ? " (add a Finnhub key in settings)" : ""}.</p>` : ""}</div>`;
   }
 
+  function sourceView(c) { // real quotes or modeled prices, said plainly
+    const qs = c.legs.map(l => l.quote).filter(Boolean), real = qs.length && qs.every(q => !q.modeled);
+    const probs = (S.facIn && S.facIn.chainProblems) || [];
+    if (real) {
+      const d = qs[0].as_of.slice(0, 10);
+      return `<p class="note"><span class="pill up">Real quotes</span> Option bids and asks from MarketData.app at the ${esc(dDay(d))} close (the free plan is one session behind), adjusted to today's stock price using each contract's own implied volatility.${probs.length ? ` ${esc(probs.join("; "))}.` : ""}</p>`;
+    }
+    return `<p class="note"><span class="pill">Modeled prices</span> Option prices here are calculated from the stock's real prices and volatility, not market quotes${probs.length ? `: ${esc(probs.join("; "))}` : ""}.</p>`;
+  }
+
   function viewModel(z) {
     const entry = S.cfg.signal.entry_z, signal = isSignal(), plan = S.mc;
     const head = `<div class="head"><div><h3 class="mid">Options model</h3><div class="small muted">Monte Carlo · every call/put combination</div></div>
@@ -2017,6 +2154,7 @@ if (typeof module !== "undefined") module.exports = Engine;
       <p class="note">${summary}</p>
       <div class="label">Best pairs trade</div>
       ${c.legs.map(legLine).join("")}
+      ${sourceView(c)}
       <div class="stats">
         <div class="stat"><span class="label">Max loss</span><span class="v">${money(c.cost)}</span></div>
         <div class="stat"><span class="label">Win chance</span><span class="v">${pct(c.pop, 0, false)}</span></div>
@@ -2042,7 +2180,7 @@ if (typeof module !== "undefined") module.exports = Engine;
         ${prec && prec.n ? `Precedent: ${prec.closed} of ${prec.n} past drifts closed${prec.median_days != null ? `, median ${Math.round(prec.median_days)} trading days` : ""}. ` : ""}
         In the simulations the gap closed within ${plan.horizon} days on ${pct(plan.converged_share, 0, false)} of paths (median exit day ${plan.median_exit_day}).
         Only bought options are considered, so the max loss is what you pay.</p></details>
-      <p class="note">Option prices are modeled and the regimes are assumptions. Check live quotes before trading. Not financial advice.</p>
+      <p class="note">${c.legs.every(l => l.quote && !l.quote.modeled) ? "Quotes are from the last close and the regimes are assumptions." : "Option prices are modeled and the regimes are assumptions."} Check live quotes with your broker before trading. Not financial advice.</p>
       <div><button class="btn sm" data-act="run-model">Re-run</button></div>
     </section>`;
   }
@@ -2065,11 +2203,12 @@ if (typeof module !== "undefined") module.exports = Engine;
         ${inClaude ? `<p class="note">Prices come from your Twelve Data connector. Live streaming runs at your web address.</p>` : `
         ${f("k-td", "Twelve Data key (history)", local.get("tdkey") ? "Saved · paste to replace" : "Required", "Free at twelvedata.com → Account → API keys.")}
         ${f("k-fh", "Finnhub key (live trades)", local.get("fhkey") ? "Saved · paste to replace" : "For live updates", "Free at finnhub.io → Dashboard → API key.")}
+        ${f("k-md", "MarketData.app token (real option quotes)", local.get("mdkey") ? "Saved · paste to replace" : "Optional", "Free at marketdata.app → Dashboard → Generate token. Quotes are from the last close.")}
         ${f("k-nt", "Alert topic (watcher status)", local.get("ntfytopic") ? "Saved · paste to replace" : "pairslab-…", "")}`}
         ${n("signal", "entry_z", "Trade signal at (σ)", 1, 0.1)}
         ${n("risk", "starting_equity", "Account size for sizing ($)", 1, 1000)}
         ${n("risk", "max_loss_per_trade_pct", "Max loss per trade (%)", 100, 0.5)}
-        <p class="note">Keys stay in this browser and go only to Twelve Data, Finnhub and ntfy.</p>
+        <p class="note">Keys stay in this browser and go only to Twelve Data, Finnhub, MarketData.app and ntfy.</p>
         <button class="btn primary block" data-act="save-settings">Save</button>`);
     }
     if (S.sheet === "add") return sheet(`<h2>Add a pair</h2><p class="note">Two companies in the same business tend to work best.</p>
@@ -2141,8 +2280,9 @@ if (typeof module !== "undefined") module.exports = Engine;
       S.sheet = null; savePrefs(); loadPair(a, b);
     } else if (act === "save-settings") {
       const val = id => ((document.getElementById(id) || {}).value || "").trim();
-      const td = val("k-td"), fh = val("k-fh"), nt = val("k-nt");
+      const td = val("k-td"), fh = val("k-fh"), nt = val("k-nt"), mdk = val("k-md");
       if (td) local.set("tdkey", td);
+      if (mdk && mdk !== local.get("mdkey")) { local.set("mdkey", mdk); for (const s of S.pair) local.set("chain." + s, null); }
       const fhChanged = fh && fh !== local.get("fhkey");
       if (fh) local.set("fhkey", fh);
       if (/^[\w-]{6,64}$/.test(nt)) { local.set("ntfytopic", nt.replace(/-status$/, "")); fetchWatch(); }
